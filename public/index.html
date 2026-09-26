@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nos Arc</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main id="app" class="shell" hidden>
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">PRIVATE MANGA ARCHIVE</p>
+          <h1>Nos Arc</h1>
+        </div>
+        <button id="logout" class="button ghost">로그아웃</button>
+      </header>
+
+      <section class="hero">
+        <div>
+          <p class="eyebrow">YOUR LIBRARY</p>
+          <h2>작품을 정리하고<br />읽을 준비를 하세요.</h2>
+          <p class="muted">원본 파일은 로컬에 보관되고, 이후 OCR과 번역 작업이 작품별로 이어집니다.</p>
+        </div>
+        <img src="/assets/uma.gif" alt="Nos Arc mascot" />
+      </section>
+
+      <section class="toolbar">
+        <input id="search" type="search" placeholder="작품 검색" />
+        <button id="new-series" class="button primary">+ 작품 추가</button>
+      </section>
+      <p id="notice" class="notice" role="status"></p>
+      <section id="series-list" class="series-grid"></section>
+    </main>
+
+    <section id="login" class="login-screen">
+      <div class="login-card">
+        <img src="/assets/uma.gif" alt="" />
+        <p class="eyebrow">PRIVATE MANGA ARCHIVE</p>
+        <h1>Nos Arc</h1>
+        <p class="muted">공유 비밀번호를 입력해 보관함을 엽니다.</p>
+        <form id="login-form">
+          <label for="password">비밀번호</label>
+          <input id="password" type="password" autocomplete="current-password" required autofocus />
+          <button class="button primary" type="submit">입장하기</button>
+          <p id="login-error" class="error"></p>
+        </form>
+      </div>
+    </section>
+
+    <dialog id="series-dialog">
+      <form id="series-form" method="dialog" class="dialog-card">
+        <div class="dialog-header"><h2>작품 추가</h2><button class="icon-button" value="cancel" aria-label="닫기">×</button></div>
+        <label for="series-title">작품명</label>
+        <input id="series-title" required maxlength="200" />
+        <label for="series-original-title">원제</label>
+        <input id="series-original-title" maxlength="200" />
+        <label for="series-tags">태그 <span class="muted">쉼표로 구분</span></label>
+        <input id="series-tags" placeholder="액션, 일상" />
+        <label for="series-description">설명</label>
+        <textarea id="series-description" rows="3"></textarea>
+        <div class="dialog-actions"><button class="button ghost" value="cancel">취소</button><button class="button primary" value="default">저장</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="chapter-dialog">
+      <form id="chapter-form" method="dialog" class="dialog-card">
+        <div class="dialog-header"><h2 id="chapter-dialog-title">권 업로드</h2><button class="icon-button" value="cancel" aria-label="닫기">×</button></div>
+        <input id="chapter-series-id" type="hidden" />
+        <label for="chapter-number">권/화 번호</label>
+        <input id="chapter-number" placeholder="예: 1, 0.5, 외전" required />
+        <label for="chapter-title">제목 <span class="muted">선택</span></label>
+        <input id="chapter-title" />
+        <label for="chapter-files">페이지 이미지</label>
+        <input id="chapter-files" type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/tiff,application/pdf,application/zip,.cbz" multiple required />
+        <p class="hint">이미지는 선택한 순서대로 저장됩니다. PDF/CBZ는 원본을 먼저 보관합니다.</p>
+        <div class="dialog-actions"><button class="button ghost" value="cancel">취소</button><button class="button primary" value="default">업로드</button></div>
+      </form>
+    </dialog>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
