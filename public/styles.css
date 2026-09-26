@@ -62,6 +62,7 @@ dialog::backdrop { background: #08070cb8; backdrop-filter: blur(3px); }
 .chapter-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 13px 0; border-bottom: 1px solid #2b2732; }
 .chapter-row strong, .chapter-row .muted { display: block; }
 .chapter-row .muted { margin-top: 4px; font-size: 13px; }
+.chapter-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
 .button.small { padding: 8px 11px; font-size: 13px; }
 .button.active { background: var(--accent-strong); color: #21121a; }
 .reader-dialog { width: min(1100px, calc(100% - 20px)); max-width: 1100px; height: min(94vh, 1000px); }

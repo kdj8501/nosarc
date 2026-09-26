@@ -69,6 +69,7 @@ async function openSeries(id) {
   document.querySelectorAll('[data-read]').forEach((button) => button.addEventListener('click', () => openReader(button.dataset.read)));
   document.querySelectorAll('[data-retry]').forEach((button) => button.addEventListener('click', () => retryJob(button.dataset.retry)));
   document.querySelectorAll('[data-cancel]').forEach((button) => button.addEventListener('click', () => cancelJob(button.dataset.cancel)));
+  document.querySelectorAll('[data-ocr]').forEach((button) => button.addEventListener('click', () => startOcr(button.dataset.ocr)));
 }
 
 function renderChapter(chapter) {
@@ -76,7 +77,8 @@ function renderChapter(chapter) {
   const statusLabels = { queued: '대기 중', preparing: '변환 중', failed: '실패', cancelled: '취소됨' };
   const status = readable ? `${chapter.page_count}페이지` : statusLabels[chapter.processing_status] || chapter.processing_status;
   const action = readable ? `<button class="button small primary" data-read="${chapter.id}">읽기</button>` : chapter.processing_status === 'failed' && chapter.job_id ? `<button class="button small primary" data-retry="${chapter.job_id}">재시도</button>` : ['queued', 'preparing'].includes(chapter.processing_status) && chapter.job_id ? `<button class="button small ghost" data-cancel="${chapter.job_id}">취소</button>` : `<button class="button small ghost" disabled>준비 중</button>`;
-  return `<article class="chapter-row"><div><strong>${escapeHtml(chapter.number_label)}${chapter.title ? ` · ${escapeHtml(chapter.title)}` : ''}</strong><span class="muted">${escapeHtml(status)}</span></div>${action}</article>`;
+  const ocrAction = readable && chapter.job_type === 'ocr' && ['queued', 'running'].includes(chapter.job_status) ? `<button class="button small ghost" data-cancel="${chapter.job_id}">OCR 취소</button>` : readable && chapter.job_type === 'ocr' && chapter.job_status === 'failed' ? `<button class="button small ghost" data-retry="${chapter.job_id}">OCR 재시도</button>` : readable ? `<button class="button small ghost" data-ocr="${chapter.id}">OCR 실행</button>` : '';
+  return `<article class="chapter-row"><div><strong>${escapeHtml(chapter.number_label)}${chapter.title ? ` · ${escapeHtml(chapter.title)}` : ''}</strong><span class="muted">${escapeHtml(status)}</span></div><div class="chapter-actions">${action}${ocrAction}</div></article>`;
 }
 
 async function retryJob(jobId) {
@@ -92,6 +94,14 @@ async function cancelJob(jobId) {
   if (!result) return;
   showNotice('작업을 취소했습니다.');
   await openSeries(state.detailSeriesId);
+}
+
+async function startOcr(chapterId) {
+  const result = await request(`/api/chapters/${chapterId}/ocr`, { method: 'POST' });
+  if (!result?.id) return;
+  showNotice('OCR 작업을 접수했습니다.');
+  await openSeries(state.detailSeriesId);
+  watchJob(result.id);
 }
 
 async function openReader(id) {

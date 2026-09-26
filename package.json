@@ -15,6 +15,7 @@
     "express": "^5.1.0",
     "multer": "^2.0.2",
     "pdfjs-dist": "^4.10.38",
+    "tesseract.js": "^7.0.0",
     "unzipper": "^0.12.5"
   }
 }

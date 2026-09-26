@@ -19,6 +19,7 @@ import {
   verifyPassword,
   verifySessionToken,
 } from './security.mjs';
+import { createOcrWorker, extractOcrBlocks, recognizePage } from './ocr.mjs';
 
 globalThis.DOMMatrix = canvas.DOMMatrix;
 globalThis.ImageData = canvas.ImageData;
@@ -47,6 +48,11 @@ const config = {
   maxPageBytes: Number(process.env.MAX_PAGE_BYTES || 67108864),
   maxExtractedBytes: Number(process.env.MAX_EXTRACTED_BYTES || 536870912),
   pdfRenderWidth: Number(process.env.PDF_RENDER_WIDTH || 1600),
+  ocrProvider: process.env.OCR_PROVIDER || 'tesseract',
+  ocrLanguage: process.env.OCR_LANGUAGE || 'jpn',
+  ocrLangPath: process.env.OCR_LANG_PATH || '',
+  ocrCachePath: resolveFromRoot(process.env.OCR_CACHE_PATH || './data/tesseract'),
+  ocrMinConfidence: Number(process.env.OCR_MIN_CONFIDENCE || 0.15),
 };
 
 if (config.env === 'production' && !config.sessionSecret) {
@@ -57,6 +63,7 @@ const dataRoot = path.dirname(config.databasePath);
 const uploadRoot = path.join(dataRoot, 'uploads');
 await fsp.mkdir(config.mediaRoot, { recursive: true });
 await fsp.mkdir(uploadRoot, { recursive: true });
+await fsp.mkdir(config.ocrCachePath, { recursive: true });
 
 const db = new Database(config.databasePath);
 db.pragma('journal_mode = WAL');
@@ -167,6 +174,8 @@ db.exec(`
 const sessions = new Map();
 const ingestQueue = [];
 let ingestActive = false;
+const ocrQueue = [];
+let ocrActive = false;
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '2mb' }));
@@ -348,6 +357,20 @@ app.get('/api/chapters/:id', (req, res) => {
   res.json(chapter);
 });
 
+app.post('/api/chapters/:id/ocr', (req, res) => {
+  const chapter = db.prepare('SELECT * FROM chapters WHERE id = ?').get(req.params.id);
+  if (!chapter) return res.status(404).json({ error: '권을 찾을 수 없습니다.' });
+  if (config.ocrProvider !== 'tesseract') return res.status(503).json({ error: `현재 OCR 제공자(${config.ocrProvider})는 사용할 수 없습니다.` });
+  if (chapter.page_count < 1) return res.status(409).json({ error: 'OCR을 실행할 페이지가 없습니다.' });
+  const activeJob = db.prepare(`SELECT * FROM jobs WHERE chapter_id = ? AND type = 'ocr' AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`).get(chapter.id);
+  if (activeJob) return res.status(409).json({ error: '이미 OCR 작업이 진행 중입니다.', job_id: activeJob.id });
+  const jobId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO jobs (id, chapter_id, type, status, current_stage, progress, created_at) VALUES (?, ?, 'ocr', 'queued', 'ocr', 0, ?)`).run(jobId, chapter.id, now);
+  enqueueOcr(jobId);
+  res.status(202).json({ id: jobId, status: 'queued' });
+});
+
 app.post('/api/pages/:id/ocr-blocks', (req, res) => {
   const page = db.prepare(`SELECT p.id FROM pages p WHERE p.id = ?`).get(req.params.id);
   if (!page) return res.status(404).json({ error: '페이지를 찾을 수 없습니다.' });
@@ -476,10 +499,11 @@ app.post('/api/jobs/:id/retry', (req, res) => {
   if (!['failed', 'cancelled'].includes(job.status)) return res.status(409).json({ error: '실패하거나 취소된 작업만 재시도할 수 있습니다.' });
   const now = new Date().toISOString();
   db.transaction(() => {
-    db.prepare(`UPDATE jobs SET status = 'queued', current_stage = 'preparing', progress = 0, error_message = NULL, started_at = NULL, finished_at = NULL WHERE id = ?`).run(job.id);
-    db.prepare(`UPDATE chapters SET processing_status = 'queued', updated_at = ? WHERE id = ?`).run(now, job.chapter_id);
+    db.prepare(`UPDATE jobs SET status = 'queued', current_stage = ?, progress = 0, error_message = NULL, started_at = NULL, finished_at = NULL WHERE id = ?`).run(job.type === 'ocr' ? 'ocr' : 'preparing', job.id);
+    if (job.type === 'ingest') db.prepare(`UPDATE chapters SET processing_status = 'queued', updated_at = ? WHERE id = ?`).run(now, job.chapter_id);
   })();
-  enqueueIngest(job.id);
+  if (job.type === 'ocr') enqueueOcr(job.id);
+  else enqueueIngest(job.id);
   res.status(202).json({ id: job.id, status: 'queued' });
 });
 
@@ -490,7 +514,7 @@ app.post('/api/jobs/:id/cancel', (req, res) => {
   const now = new Date().toISOString();
   db.transaction(() => {
     db.prepare(`UPDATE jobs SET status = 'cancelled', current_stage = 'cancelled', finished_at = ? WHERE id = ?`).run(now, job.id);
-    db.prepare(`UPDATE chapters SET processing_status = 'cancelled', updated_at = ? WHERE id = ?`).run(now, job.chapter_id);
+    if (job.type === 'ingest') db.prepare(`UPDATE chapters SET processing_status = 'cancelled', updated_at = ? WHERE id = ?`).run(now, job.chapter_id);
   })();
   res.json({ id: job.id, status: 'cancelled' });
 });
@@ -550,6 +574,7 @@ function listChapters(seriesId) {
     WHERE c.series_id = ? ORDER BY c.sort_key ASC, c.created_at ASC`).all(seriesId).map((chapter) => ({
     ...chapter,
     job_id: db.prepare('SELECT id FROM jobs WHERE chapter_id = ? ORDER BY created_at DESC LIMIT 1').get(chapter.id)?.id || null,
+    job_type: db.prepare('SELECT type FROM jobs WHERE chapter_id = ? ORDER BY created_at DESC LIMIT 1').get(chapter.id)?.type || null,
     job_status: db.prepare('SELECT status FROM jobs WHERE chapter_id = ? ORDER BY created_at DESC LIMIT 1').get(chapter.id)?.status || null,
   }));
 }
@@ -609,6 +634,75 @@ function groupBy(rows, key) {
     (groups[row[key]] ||= []).push(row);
     return groups;
   }, {});
+}
+
+function enqueueOcr(jobId) {
+  if (!ocrQueue.includes(jobId)) ocrQueue.push(jobId);
+  void drainOcrQueue();
+}
+
+async function drainOcrQueue() {
+  if (ocrActive) return;
+  ocrActive = true;
+  try {
+    while (ocrQueue.length) await runOcrJob(ocrQueue.shift());
+  } finally {
+    ocrActive = false;
+  }
+}
+
+async function runOcrJob(jobId) {
+  const job = db.prepare(`SELECT * FROM jobs WHERE id = ? AND type = 'ocr'`).get(jobId);
+  if (!job || job.status === 'cancelled') return;
+  const pages = db.prepare(`SELECT p.*, a.storage_key, a.original_name, a.mime_type FROM pages p
+    JOIN assets a ON a.id = p.image_asset_id WHERE p.chapter_id = ? ORDER BY p.page_index`).all(job.chapter_id);
+  if (!pages.length) return failOcrJob(jobId, 'OCR을 실행할 페이지가 없습니다.');
+
+  db.prepare(`UPDATE jobs SET status = 'running', current_stage = 'ocr', progress = 1, started_at = ?, error_message = NULL WHERE id = ?`)
+    .run(new Date().toISOString(), jobId);
+  let worker;
+  try {
+    await clearOcrResults(job.chapter_id);
+    worker = await createOcrWorker(config);
+    for (const [index, page] of pages.entries()) {
+      if (isJobCancelled(jobId)) return;
+      const data = await recognizePage(worker, assetPath(page));
+      const blocks = extractOcrBlocks(data, page.width || 1, page.height || 1, { minConfidence: config.ocrMinConfidence });
+      const now = new Date().toISOString();
+      const insertBlocks = db.transaction(() => {
+        for (const block of blocks) {
+          db.prepare(`INSERT INTO ocr_blocks (id, page_id, polygon_json, source_text, source_language, confidence, reading_order, model_id, model_version, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'tesseract', 'tesseract.js', ?, ?)`).run(
+            crypto.randomUUID(), page.id, JSON.stringify(block.polygon), block.sourceText, config.ocrLanguage,
+            block.confidence, block.readingOrder, now, now,
+          );
+        }
+      });
+      insertBlocks();
+      db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(95, Math.round(((index + 1) / pages.length) * 95)), jobId);
+    }
+    const finishedAt = new Date().toISOString();
+    db.prepare(`UPDATE jobs SET status = 'completed', current_stage = 'completed', progress = 100, finished_at = ?, error_message = NULL WHERE id = ?`).run(finishedAt, jobId);
+  } catch (error) {
+    if (!isJobCancelled(jobId)) await failOcrJob(jobId, error.message || 'OCR 처리에 실패했습니다.');
+  } finally {
+    if (worker) await worker.terminate().catch(() => undefined);
+  }
+}
+
+async function clearOcrResults(chapterId) {
+  db.transaction(() => {
+    db.prepare(`DELETE FROM lettering_layers WHERE translation_id IN (
+      SELECT t.id FROM translations t JOIN ocr_blocks b ON b.id = t.ocr_block_id JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ?
+    )`).run(chapterId);
+    db.prepare('DELETE FROM ocr_blocks WHERE page_id IN (SELECT id FROM pages WHERE chapter_id = ?)').run(chapterId);
+  })();
+}
+
+async function failOcrJob(jobId, message) {
+  const current = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
+  if (!current || current.status === 'cancelled') return;
+  db.prepare(`UPDATE jobs SET status = 'failed', current_stage = 'failed', error_message = ?, finished_at = ? WHERE id = ?`).run(String(message).slice(0, 500), new Date().toISOString(), jobId);
 }
 
 function enqueueIngest(jobId) {
