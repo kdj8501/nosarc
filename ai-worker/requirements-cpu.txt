@@ -3,3 +3,4 @@
 -r requirements.txt
 torch>=2.2
 manga-ocr==0.1.16
+onnxruntime>=1.18,<2

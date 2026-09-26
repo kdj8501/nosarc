@@ -8,6 +8,7 @@ export async function renderTranslatedPage(sourcePath, layers, {
   inpaintPadding = 0.008,
   fontFamily = 'Malgun Gothic',
   fontPath = '',
+  skipInpaint = false,
 } = {}) {
   registerFont(fontPath, fontFamily);
   const image = await loadImage(sourcePath);
@@ -18,14 +19,37 @@ export async function renderTranslatedPage(sourcePath, layers, {
   context.drawImage(image, 0, 0, width, height);
 
   const safeLayers = layers.filter((layer) => getBounds(layer.polygon_json || layer.polygon, width, height));
-  const imageData = context.getImageData(0, 0, width, height);
-  const mask = new Uint8Array(width * height);
-  for (const layer of safeLayers) markMask(mask, width, height, layer, inpaintPadding);
-  inpaint(imageData, mask, width, height);
-  context.putImageData(imageData, 0, 0);
+  if (!skipInpaint) {
+    const imageData = context.getImageData(0, 0, width, height);
+    const mask = new Uint8Array(width * height);
+    for (const layer of safeLayers) markMask(mask, width, height, layer, inpaintPadding);
+    inpaint(imageData, mask, width, height);
+    context.putImageData(imageData, 0, 0);
+  }
 
   for (const layer of safeLayers) drawLettering(context, layer, width, height, fontFamily);
   return output.toBuffer('image/png');
+}
+
+export async function createInpaintMask(sourcePath, layers, { inpaintPadding = 0.008 } = {}) {
+  const image = await loadImage(sourcePath);
+  const maskCanvas = createCanvas(image.width, image.height);
+  const context = maskCanvas.getContext('2d');
+  context.fillStyle = '#000000';
+  context.fillRect(0, 0, image.width, image.height);
+  context.fillStyle = '#ffffff';
+  for (const layer of layers) {
+    const bounds = getBounds(layer.polygon_json || layer.polygon, image.width, image.height);
+    if (!bounds) continue;
+    const padX = Math.max(1, Math.round(image.width * Math.max(0, Number(inpaintPadding) || 0)));
+    const padY = Math.max(1, Math.round(image.height * Math.max(0, Number(inpaintPadding) || 0)));
+    const left = Math.max(0, bounds.left - padX);
+    const top = Math.max(0, bounds.top - padY);
+    const right = Math.min(image.width, bounds.right + padX);
+    const bottom = Math.min(image.height, bounds.bottom + padY);
+    context.fillRect(left, top, Math.max(1, right - left), Math.max(1, bottom - top));
+  }
+  return maskCanvas.toBuffer('image/png');
 }
 
 function markMask(mask, width, height, layer, padding) {

@@ -21,7 +21,7 @@ import {
   verifySessionToken,
 } from './security.mjs';
 import { createOcrWorker, extractOcrBlocks, recognizePage } from './ocr.mjs';
-import { renderTranslatedPage } from './render.mjs';
+import { createInpaintMask, renderTranslatedPage } from './render.mjs';
 
 globalThis.DOMMatrix = canvas.DOMMatrix;
 globalThis.ImageData = canvas.ImageData;
@@ -58,6 +58,10 @@ const config = {
   ocrMangaModel: process.env.OCR_MANGA_MODEL || 'kha-white/manga-ocr-base',
   ocrMangaCachePath: resolveFromRoot(process.env.OCR_MANGA_CACHE_PATH || './data/models/huggingface'),
   ocrMangaPadding: Number(process.env.OCR_MANGA_PADDING || 0.04),
+  inpaintProvider: process.env.INPAINT_PROVIDER || 'lama',
+  inpaintModelPath: resolveFromRoot(process.env.INPAINT_MODEL_PATH || './data/models/lama/inpainting_lama_2025jan.onnx'),
+  inpaintWorkPath: resolveFromRoot(process.env.INPAINT_WORK_PATH || './data/inpaint'),
+  inpaintThreads: Math.max(1, Number(process.env.INPAINT_THREADS || 1)),
   inpaintPadding: Number(process.env.INPAINT_PADDING || 0.008),
   letteringFontPath: process.env.LETTERING_FONT_PATH || (process.platform === 'win32' ? 'C:\\Windows\\Fonts\\malgun.ttf' : ''),
   aiTranslationProvider: process.env.AI_TRANSLATION_PROVIDER || 'ctranslate2',
@@ -82,6 +86,8 @@ await fsp.mkdir(config.mediaRoot, { recursive: true });
 await fsp.mkdir(uploadRoot, { recursive: true });
 await fsp.mkdir(config.ocrCachePath, { recursive: true });
 await fsp.mkdir(config.ocrMangaCachePath, { recursive: true });
+await fsp.mkdir(config.inpaintWorkPath, { recursive: true });
+await fsp.mkdir(path.dirname(config.inpaintModelPath), { recursive: true });
 await fsp.mkdir(path.dirname(config.aiTranslationModelPath), { recursive: true });
 
 const db = new Database(config.databasePath);
@@ -582,6 +588,7 @@ app.post('/api/jobs/:id/cancel', (req, res) => {
     if (job.type === 'ingest') db.prepare(`UPDATE chapters SET processing_status = 'cancelled', updated_at = ? WHERE id = ?`).run(now, job.chapter_id);
   })();
   if (job.type === 'auto_translate') activeAiProcesses.get(job.id)?.kill();
+  if (job.type === 'render') activeAiProcesses.get(job.id)?.kill();
   res.json({ id: job.id, status: 'cancelled' });
 });
 
@@ -858,18 +865,49 @@ async function renderChapterImages(chapterId, jobId = null, onProgress = () => {
   const layers = db.prepare(`SELECT l.* FROM lettering_layers l JOIN pages p ON p.id = l.page_id
     WHERE p.chapter_id = ? AND l.is_active = 1 AND TRIM(l.text) <> '' ORDER BY l.created_at`).all(chapterId);
   const layersByPage = groupBy(layers, 'page_id');
-  for (const [index, page] of pages.entries()) {
-    if (jobId && isJobCancelled(jobId)) return false;
-    const pageLayers = layersByPage[page.id] || [];
-    if (pageLayers.length) {
-      const buffer = await renderTranslatedPage(assetPath(page), pageLayers, { inpaintPadding: config.inpaintPadding, fontPath: config.letteringFontPath });
-      await saveRenderedPage(page, buffer);
-    } else {
-      await clearRenderedPage(page.id);
+  const workToken = crypto.randomUUID();
+  const inpaintPages = [];
+  try {
+    for (const page of pages) {
+      const pageLayers = layersByPage[page.id] || [];
+      if (!pageLayers.length) continue;
+      const maskPath = path.join(config.inpaintWorkPath, `${workToken}-${page.id}-mask.png`);
+      const outputPath = path.join(config.inpaintWorkPath, `${workToken}-${page.id}-lama.png`);
+      await fsp.writeFile(maskPath, await createInpaintMask(assetPath(page), pageLayers, { inpaintPadding: config.inpaintPadding }));
+      inpaintPages.push({ pageId: page.id, imagePath: assetPath(page), maskPath, outputPath });
     }
-    onProgress(((index + 1) / Math.max(1, pages.length)) * 100);
+
+    let aiOutputs = new Map();
+    if (config.inpaintProvider === 'lama' && inpaintPages.length && fs.existsSync(config.inpaintModelPath)) {
+      try {
+        aiOutputs = await runLamaInpaintWorker(jobId || workToken, inpaintPages, (progress) => onProgress(Math.min(70, progress * 0.7)));
+      } catch (error) {
+        if (jobId && isJobCancelled(jobId)) return false;
+        console.warn(`LaMa 인페인팅을 사용할 수 없어 CPU 보간으로 대체합니다: ${error.message}`);
+      }
+    }
+
+    for (const [index, page] of pages.entries()) {
+      if (jobId && isJobCancelled(jobId)) return false;
+      const pageLayers = layersByPage[page.id] || [];
+      if (pageLayers.length) {
+        const aiOutput = aiOutputs.get(page.id);
+        const basePath = aiOutput || assetPath(page);
+        const buffer = await renderTranslatedPage(basePath, pageLayers, {
+          inpaintPadding: config.inpaintPadding,
+          fontPath: config.letteringFontPath,
+          skipInpaint: Boolean(aiOutput),
+        });
+        await saveRenderedPage(page, buffer);
+      } else {
+        await clearRenderedPage(page.id);
+      }
+      onProgress(Math.max(70, ((index + 1) / Math.max(1, pages.length)) * 100));
+    }
+    return true;
+  } finally {
+    await Promise.all(inpaintPages.flatMap((page) => [page.maskPath, page.outputPath].map((filePath) => fsp.unlink(filePath).catch(() => undefined))));
   }
-  return true;
 }
 
 async function saveRenderedPage(page, buffer) {
@@ -1032,6 +1070,9 @@ function runAiWorkerProcess(jobId, payload, onEvent, extraEnv = {}) {
           HF_HOME: config.ocrMangaCachePath,
           OCR_MANGA_MODEL: config.ocrMangaModel,
           OCR_MANGA_PADDING: String(config.ocrMangaPadding),
+          INPAINT_PROVIDER: config.inpaintProvider,
+          INPAINT_MODEL_PATH: config.inpaintModelPath,
+          INPAINT_THREADS: String(config.inpaintThreads),
           ...extraEnv,
         },
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -1125,6 +1166,19 @@ async function runMangaOcrWorker(jobId, detections, onProgress) {
     }
   });
   return results;
+}
+
+async function runLamaInpaintWorker(jobId, pages, onProgress) {
+  const outputs = new Map();
+  await runAiWorkerProcess(jobId, { kind: 'inpaint', pages }, (event) => {
+    if (event.type === 'progress') {
+      onProgress(Math.min(100, Math.max(0, Number(event.progress) || 0)));
+    }
+    if (event.type === 'inpaint_result' && event.pageId && event.outputPath) {
+      outputs.set(String(event.pageId), String(event.outputPath));
+    }
+  });
+  return outputs;
 }
 
 async function failAutoTranslationJob(jobId, message) {

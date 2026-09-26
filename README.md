@@ -16,7 +16,7 @@
 - Tesseract.js 검출 + Manga OCR 재인식 기반 일본어 OCR 작업과 진행 상태
 - 리더 안에서 OCR 블록별 번역문과 기본 식자 스타일 편집
 - 로컬 CTranslate2 기반 자동 번역·식자 작업 큐
-- CPU 기반 원문 영역 제거·배경 보간·번역 이미지 렌더링
+- CPU 기반 LaMa 원문 영역 제거·배경 복원·번역 이미지 렌더링
 - PDF/CBZ 원본 업로드 접수 및 작업 상태 모델
 - 원본 파일과 페이지 파일을 보호된 `/media/:id`로 제공
 - 첫 번째 라이브러리 화면과 업로드 폼
@@ -25,7 +25,7 @@
 
 리더에서 `번역 편집`을 누르면 OCR 블록별 번역문을 입력하고 세로쓰기/가로쓰기와 글자 크기를 저장할 수 있습니다. 저장된 결과는 번역 모드의 식자 레이어로 표시됩니다. 역식 데이터 API는 `POST /api/pages/:id/ocr-blocks`, `POST /api/ocr-blocks/:id/translations`, `PATCH /api/lettering-layers/:id`이며, 좌표는 페이지 기준 0~1 정규화 좌표를 사용합니다.
 
-OCR이 끝난 권은 상세 화면의 `자동 번역·식자` 버튼으로 로컬 번역 작업을 실행할 수 있습니다. 번역이 끝나면 OCR 영역 주변 픽셀을 이용해 원문을 제거하고, 번역문을 페이지 이미지에 직접 렌더링합니다. 리더의 `이미지 다시 렌더링` 버튼으로 수동 번역 수정 결과도 다시 이미지화할 수 있습니다. 현재 인페인팅은 N100에서 별도 대형 모델 없이 동작하는 주변 픽셀 보간 방식이며, 복잡한 배경은 후속 딥러닝 인페인팅 단계에서 개선합니다.
+OCR이 끝난 권은 상세 화면의 `자동 번역·식자` 버튼으로 로컬 번역 작업을 실행할 수 있습니다. 번역이 끝나면 OCR 영역 마스크를 LaMa 딥러닝 모델에 전달해 원문을 제거·복원하고, 번역문을 페이지 이미지에 직접 렌더링합니다. 리더의 `이미지 다시 렌더링` 버튼으로 수동 번역 수정 결과도 다시 이미지화할 수 있습니다. LaMa 모델이 없거나 실행에 실패하면 기존 주변 픽셀 보간 방식으로 자동 대체합니다.
 
 ## 실행
 
@@ -49,7 +49,7 @@ py -3.11 -m venv ai-worker/.venv
 & .\ai-worker\.venv\Scripts\python.exe -m pip install -r ai-worker/requirements-cpu.txt
 ```
 
-`requirements-cpu.txt`는 CUDA를 설치하지 않고 CPU 전용 PyTorch를 사용합니다. 모델 변환기와 Manga OCR 실행을 위해 PyTorch를 함께 설치합니다. Manga OCR 모델도 첫 OCR 실행 시 Hugging Face 캐시(`data/models/huggingface`)에 내려받습니다.
+`requirements-cpu.txt`는 CUDA를 설치하지 않고 CPU 전용 PyTorch와 ONNX Runtime을 사용합니다. 모델 변환기, Manga OCR, LaMa ONNX 실행을 위해 필요한 CPU 라이브러리를 함께 설치합니다. Manga OCR 모델은 첫 OCR 실행 시 Hugging Face 캐시(`data/models/huggingface`)에 내려받고, LaMa ONNX 모델은 `data/models/lama/`에 준비합니다.
 
 Windows에서는 기본적으로 `C:\Windows\Fonts\malgun.ttf`를 식자 폰트로 사용합니다. 다른 한글 폰트를 쓰려면 `.env`의 `LETTERING_FONT_PATH`를 변경하세요.
 
@@ -58,6 +58,10 @@ Windows에서는 기본적으로 `C:\Windows\Fonts\malgun.ttf`를 식자 폰트�
 ```powershell
 & .\ai-worker\.venv\Scripts\hf.exe download facebook/nllb-200-distilled-600M --local-dir data/models/nllb-200-distilled-600M
 & .\ai-worker\.venv\Scripts\ct2-transformers-converter.exe --model data/models/nllb-200-distilled-600M --quantization int8 --output_dir data/models/nllb-200-distilled-600M-ct2
+```
+
+```powershell
+& .\ai-worker\.venv\Scripts\hf.exe download opencv/inpainting_lama inpainting_lama_2025jan.onnx --local-dir data/models/lama
 ```
 
 Python 실행 파일이 `python` 명령으로 연결되지 않으면 `.env`의 `AI_WORKER_COMMAND`에 가상 환경의 절대 경로를 지정하세요. 모델 파일과 가상 환경은 Git에 커밋되지 않습니다.

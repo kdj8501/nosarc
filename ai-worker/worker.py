@@ -142,6 +142,67 @@ def recognize_manga(request: dict[str, Any]) -> None:
     emit({"type": "done", "progress": 100})
 
 
+def inpaint_lama(request: dict[str, Any]) -> None:
+    try:
+        import numpy as np
+        import onnxruntime as ort
+        from PIL import Image
+    except ImportError as error:
+        raise RuntimeError(
+            "LaMa ONNX Runtime 의존성이 없습니다. ai-worker/requirements-cpu.txt를 설치해 주세요."
+        ) from error
+
+    model_path = os.environ.get("INPAINT_MODEL_PATH", "")
+    if not model_path or not os.path.isfile(model_path):
+        raise RuntimeError(f"LaMa ONNX 모델을 찾을 수 없습니다: {model_path}")
+    pages = request.get("pages", [])
+    if not pages:
+        raise RuntimeError("LaMa 인페인팅 대상 페이지가 없습니다.")
+
+    session_options = ort.SessionOptions()
+    session_options.log_severity_level = 3
+    session_options.intra_op_num_threads = max(1, int(os.environ.get("INPAINT_THREADS", "1")))
+    session_options.inter_op_num_threads = 1
+    session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    model = ort.InferenceSession(model_path, sess_options=session_options, providers=["CPUExecutionProvider"])
+    emit({"type": "progress", "stage": "lama-model-loaded", "progress": 5})
+
+    for index, page in enumerate(pages):
+        image_path = str(page.get("imagePath", ""))
+        mask_path = str(page.get("maskPath", ""))
+        output_path = str(page.get("outputPath", ""))
+        if not os.path.isfile(image_path):
+            raise RuntimeError(f"LaMa 입력 이미지를 읽을 수 없습니다: {image_path}")
+        if not os.path.isfile(mask_path):
+            raise RuntimeError(f"LaMa 마스크를 읽을 수 없습니다: {mask_path}")
+        with Image.open(image_path) as source:
+            image = source.convert("RGB")
+        with Image.open(mask_path) as source_mask:
+            mask = source_mask.convert("L")
+        original_size = image.size
+        resized_image = image.resize((512, 512), Image.Resampling.BILINEAR)
+        resized_mask = mask.resize((512, 512), Image.Resampling.NEAREST)
+        image_array = np.asarray(resized_image, dtype=np.float32)[:, :, ::-1] / 255.0
+        mask_array = (np.asarray(resized_mask, dtype=np.float32) > 0).astype(np.float32)
+        image_tensor = np.transpose(image_array, (2, 0, 1))[None, ...]
+        mask_tensor = mask_array[None, None, ...]
+        output = model.run(["output"], {"image": image_tensor, "mask": mask_tensor})[0][0]
+        output = np.transpose(output, (1, 2, 0))
+        if float(output.max()) <= 1.5:
+            output = output * 255.0
+        output = np.clip(output, 0, 255).astype(np.uint8)[:, :, ::-1]
+        output_image = Image.fromarray(output, mode="RGB").resize(original_size, Image.Resampling.BICUBIC)
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        output_image.save(output_path, format="PNG")
+        emit({
+            "type": "inpaint_result",
+            "pageId": str(page.get("pageId", "")),
+            "outputPath": output_path,
+            "progress": 5 + int(((index + 1) / len(pages)) * 90),
+        })
+    emit({"type": "done", "progress": 100})
+
+
 def main() -> int:
     for raw_line in sys.stdin.buffer:
         if not raw_line.strip():
@@ -150,6 +211,8 @@ def main() -> int:
             request = json.loads(raw_line.decode("utf-8"))
             if request.get("kind", "translate") == "ocr":
                 recognize_manga(request)
+            elif request.get("kind") == "inpaint":
+                inpaint_lama(request)
             else:
                 translate(request)
             return 0
