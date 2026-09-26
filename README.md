@@ -15,6 +15,7 @@
 - OCR 블록·번역문·식자 레이어 저장 API와 리더 오버레이
 - Tesseract.js 기반 일본어 OCR 작업과 진행 상태
 - 리더 안에서 OCR 블록별 번역문과 기본 식자 스타일 편집
+- 로컬 CTranslate2 기반 자동 번역·식자 작업 큐
 - PDF/CBZ 원본 업로드 접수 및 작업 상태 모델
 - 원본 파일과 페이지 파일을 보호된 `/media/:id`로 제공
 - 첫 번째 라이브러리 화면과 업로드 폼
@@ -22,6 +23,8 @@
 현재 OCR 엔진은 Tesseract.js 기반 일본어 인식(`OCR_LANGUAGE=jpn`)이며, 서버별 모델 선택을 위해 어댑터 경계를 유지합니다. 이후 Manga OCR/Argos 등의 어댑터가 같은 계약으로 결과를 저장할 수 있습니다.
 
 리더에서 `번역 편집`을 누르면 OCR 블록별 번역문을 입력하고 세로쓰기/가로쓰기와 글자 크기를 저장할 수 있습니다. 저장된 결과는 번역 모드의 식자 레이어로 표시됩니다. 역식 데이터 API는 `POST /api/pages/:id/ocr-blocks`, `POST /api/ocr-blocks/:id/translations`, `PATCH /api/lettering-layers/:id`이며, 좌표는 페이지 기준 0~1 정규화 좌표를 사용합니다.
+
+OCR이 끝난 권은 상세 화면의 `자동 번역·식자` 버튼으로 로컬 번역 작업을 실행할 수 있습니다. 이 단계는 기존 원문 위에 번역문을 식자 레이어로 생성하며, 재실행하면 기존 번역 레이어를 새 결과로 교체합니다. 원문 제거와 복잡한 배경 복원은 다음 인페인팅 단계에서 추가합니다.
 
 ## 실행
 
@@ -36,6 +39,21 @@ npm start
 브라우저에서 `http://localhost:3000`을 열고 개발 환경 기본 비밀번호 `change-this-password`로 로그인합니다. 실제 사용 전에는 `.env`의 `NOSARC_ACCESS_PASSWORD`를 바꾸거나 `NOSARC_ACCESS_PASSWORD_HASH`에 Argon2id 해시를 설정하세요.
 
 첫 OCR 실행 시 `jpn.traineddata`를 `data/tesseract/`에 내려받으며, 이 디렉터리는 Git에서 무시됩니다. 네트워크가 차단된 환경에서는 `OCR_LANG_PATH`로 미리 받은 언어 데이터를 지정하세요.
+
+자동 번역 워커는 Python 3.11 이상과 로컬 CTranslate2 모델이 필요합니다. N100·16GB 환경에서는 워커를 한 개만 실행하고 INT8 모델을 사용하도록 기본값을 둡니다.
+
+```powershell
+py -3.11 -m venv ai-worker/.venv
+& .\ai-worker\.venv\Scripts\python.exe -m pip install -r ai-worker/requirements.txt
+```
+
+Hugging Face의 호환 Marian/OPUS-MT 일본어→한국어 모델을 `data/models/opus-mt-ja-ko`에 준비한 뒤 CTranslate2 형식으로 변환합니다. 모델 경로와 변환 방식은 `.env`의 `AI_TRANSLATION_MODEL_PATH`, `AI_TRANSLATION_TOKENIZER_PATH`로 바꿀 수 있습니다.
+
+```powershell
+ct2-transformers-converter --model data/models/opus-mt-ja-ko --quantization int8 --output_dir data/models/opus-mt-ja-ko-ct2
+```
+
+Python 실행 파일이 `python` 명령으로 연결되지 않으면 `.env`의 `AI_WORKER_COMMAND`에 가상 환경의 절대 경로를 지정하세요. 모델 파일과 가상 환경은 Git에 커밋되지 않습니다.
 
 ```powershell
 npm test

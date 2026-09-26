@@ -1,4 +1,5 @@
 import 'node:process';
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -53,6 +54,13 @@ const config = {
   ocrLangPath: process.env.OCR_LANG_PATH || '',
   ocrCachePath: resolveFromRoot(process.env.OCR_CACHE_PATH || './data/tesseract'),
   ocrMinConfidence: Number(process.env.OCR_MIN_CONFIDENCE || 0.15),
+  aiTranslationProvider: process.env.AI_TRANSLATION_PROVIDER || 'ctranslate2',
+  aiWorkerCommand: process.env.AI_WORKER_COMMAND || 'python',
+  aiWorkerScript: resolveFromRoot(process.env.AI_WORKER_SCRIPT || './ai-worker/worker.py'),
+  aiTranslationModelPath: resolveFromRoot(process.env.AI_TRANSLATION_MODEL_PATH || './data/models/opus-mt-ja-ko-ct2'),
+  aiTranslationTokenizerPath: resolveFromRoot(process.env.AI_TRANSLATION_TOKENIZER_PATH || './data/models/opus-mt-ja-ko'),
+  aiTranslationComputeType: process.env.AI_TRANSLATION_COMPUTE_TYPE || 'int8',
+  aiWorkerThreads: Math.max(1, Number(process.env.AI_WORKER_THREADS || 1)),
 };
 
 if (config.env === 'production' && !config.sessionSecret) {
@@ -64,6 +72,7 @@ const uploadRoot = path.join(dataRoot, 'uploads');
 await fsp.mkdir(config.mediaRoot, { recursive: true });
 await fsp.mkdir(uploadRoot, { recursive: true });
 await fsp.mkdir(config.ocrCachePath, { recursive: true });
+await fsp.mkdir(path.dirname(config.aiTranslationModelPath), { recursive: true });
 
 const db = new Database(config.databasePath);
 db.pragma('journal_mode = WAL');
@@ -176,6 +185,9 @@ const ingestQueue = [];
 let ingestActive = false;
 const ocrQueue = [];
 let ocrActive = false;
+const autoTranslationQueue = [];
+let autoTranslationActive = false;
+const activeAiProcesses = new Map();
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '2mb' }));
@@ -371,6 +383,22 @@ app.post('/api/chapters/:id/ocr', (req, res) => {
   res.status(202).json({ id: jobId, status: 'queued' });
 });
 
+app.post('/api/chapters/:id/auto-translate', (req, res) => {
+  const chapter = db.prepare('SELECT * FROM chapters WHERE id = ?').get(req.params.id);
+  if (!chapter) return res.status(404).json({ error: '권을 찾을 수 없습니다.' });
+  if (config.aiTranslationProvider !== 'ctranslate2') return res.status(503).json({ error: `현재 번역 제공자(${config.aiTranslationProvider})는 사용할 수 없습니다.` });
+  if (chapter.page_count < 1 || chapter.processing_status !== 'completed') return res.status(409).json({ error: '페이지 변환이 완료된 권에서만 자동 번역을 실행할 수 있습니다.' });
+  const blockCount = db.prepare(`SELECT COUNT(*) AS count FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ?`).get(chapter.id).count;
+  if (!blockCount) return res.status(409).json({ error: '먼저 OCR을 실행해 번역할 텍스트를 만들어 주세요.' });
+  const activeJob = db.prepare(`SELECT * FROM jobs WHERE chapter_id = ? AND type = 'auto_translate' AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`).get(chapter.id);
+  if (activeJob) return res.status(409).json({ error: '이미 자동 번역 작업이 진행 중입니다.', job_id: activeJob.id });
+  const jobId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO jobs (id, chapter_id, type, status, current_stage, progress, created_at) VALUES (?, ?, 'auto_translate', 'queued', 'translation', 0, ?)`).run(jobId, chapter.id, now);
+  enqueueAutoTranslation(jobId);
+  res.status(202).json({ id: jobId, type: 'auto_translate', status: 'queued' });
+});
+
 app.post('/api/pages/:id/ocr-blocks', (req, res) => {
   const page = db.prepare(`SELECT p.id FROM pages p WHERE p.id = ?`).get(req.params.id);
   if (!page) return res.status(404).json({ error: '페이지를 찾을 수 없습니다.' });
@@ -499,10 +527,11 @@ app.post('/api/jobs/:id/retry', (req, res) => {
   if (!['failed', 'cancelled'].includes(job.status)) return res.status(409).json({ error: '실패하거나 취소된 작업만 재시도할 수 있습니다.' });
   const now = new Date().toISOString();
   db.transaction(() => {
-    db.prepare(`UPDATE jobs SET status = 'queued', current_stage = ?, progress = 0, error_message = NULL, started_at = NULL, finished_at = NULL WHERE id = ?`).run(job.type === 'ocr' ? 'ocr' : 'preparing', job.id);
+    db.prepare(`UPDATE jobs SET status = 'queued', current_stage = ?, progress = 0, error_message = NULL, started_at = NULL, finished_at = NULL WHERE id = ?`).run(job.type === 'ocr' ? 'ocr' : job.type === 'auto_translate' ? 'translation' : 'preparing', job.id);
     if (job.type === 'ingest') db.prepare(`UPDATE chapters SET processing_status = 'queued', updated_at = ? WHERE id = ?`).run(now, job.chapter_id);
   })();
   if (job.type === 'ocr') enqueueOcr(job.id);
+  else if (job.type === 'auto_translate') enqueueAutoTranslation(job.id);
   else enqueueIngest(job.id);
   res.status(202).json({ id: job.id, status: 'queued' });
 });
@@ -516,6 +545,7 @@ app.post('/api/jobs/:id/cancel', (req, res) => {
     db.prepare(`UPDATE jobs SET status = 'cancelled', current_stage = 'cancelled', finished_at = ? WHERE id = ?`).run(now, job.id);
     if (job.type === 'ingest') db.prepare(`UPDATE chapters SET processing_status = 'cancelled', updated_at = ? WHERE id = ?`).run(now, job.chapter_id);
   })();
+  if (job.type === 'auto_translate') activeAiProcesses.get(job.id)?.kill();
   res.json({ id: job.id, status: 'cancelled' });
 });
 
@@ -573,6 +603,8 @@ function listChapters(seriesId) {
   return db.prepare(`SELECT c.*, a.original_name AS source_name FROM chapters c JOIN assets a ON a.id = c.source_asset_id
     WHERE c.series_id = ? ORDER BY c.sort_key ASC, c.created_at ASC`).all(seriesId).map((chapter) => ({
     ...chapter,
+    ocr_block_count: db.prepare('SELECT COUNT(*) AS count FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ?').get(chapter.id).count,
+    translation_count: db.prepare('SELECT COUNT(*) AS count FROM translations t JOIN ocr_blocks b ON b.id = t.ocr_block_id JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ? AND t.is_active = 1').get(chapter.id).count,
     job_id: db.prepare('SELECT id FROM jobs WHERE chapter_id = ? ORDER BY created_at DESC LIMIT 1').get(chapter.id)?.id || null,
     job_type: db.prepare('SELECT type FROM jobs WHERE chapter_id = ? ORDER BY created_at DESC LIMIT 1').get(chapter.id)?.type || null,
     job_status: db.prepare('SELECT status FROM jobs WHERE chapter_id = ? ORDER BY created_at DESC LIMIT 1').get(chapter.id)?.status || null,
@@ -700,6 +732,178 @@ async function clearOcrResults(chapterId) {
 }
 
 async function failOcrJob(jobId, message) {
+  const current = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
+  if (!current || current.status === 'cancelled') return;
+  db.prepare(`UPDATE jobs SET status = 'failed', current_stage = 'failed', error_message = ?, finished_at = ? WHERE id = ?`).run(String(message).slice(0, 500), new Date().toISOString(), jobId);
+}
+
+function enqueueAutoTranslation(jobId) {
+  if (!autoTranslationQueue.includes(jobId)) autoTranslationQueue.push(jobId);
+  void drainAutoTranslationQueue();
+}
+
+async function drainAutoTranslationQueue() {
+  if (autoTranslationActive) return;
+  autoTranslationActive = true;
+  try {
+    while (autoTranslationQueue.length) await runAutoTranslationJob(autoTranslationQueue.shift());
+  } finally {
+    autoTranslationActive = false;
+  }
+}
+
+async function runAutoTranslationJob(jobId) {
+  const job = db.prepare(`SELECT * FROM jobs WHERE id = ? AND type = 'auto_translate'`).get(jobId);
+  if (!job || job.status === 'cancelled') return;
+  const chapter = db.prepare(`SELECT c.*, s.target_language FROM chapters c JOIN series s ON s.id = c.series_id WHERE c.id = ?`).get(job.chapter_id);
+  const blocks = db.prepare(`SELECT b.*, p.width, p.height FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ? ORDER BY p.page_index, b.reading_order, b.created_at`).all(job.chapter_id);
+  if (!chapter || !blocks.length) return failAutoTranslationJob(jobId, '자동 번역할 OCR 블록이 없습니다.');
+
+  db.prepare(`UPDATE jobs SET status = 'running', current_stage = 'translation', progress = 1, started_at = ?, error_message = NULL WHERE id = ?`)
+    .run(new Date().toISOString(), jobId);
+  try {
+    const results = await runTranslationWorker(jobId, {
+      sourceLanguage: 'ja',
+      targetLanguage: chapter.target_language || 'ko',
+      texts: blocks.map((block) => block.source_text),
+    }, (progress) => {
+      db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(95, 5 + Math.round(progress * 0.9)), jobId);
+    });
+    if (isJobCancelled(jobId)) return;
+    if (!Array.isArray(results) || results.length !== blocks.length) throw new Error('AI 워커가 모든 OCR 블록의 번역 결과를 반환하지 않았습니다.');
+
+    const now = new Date().toISOString();
+    const saveTranslations = db.transaction(() => {
+      for (const [index, result] of results.entries()) {
+        const translatedText = String(result?.text || '').trim();
+        if (!translatedText) continue;
+        const block = blocks[index];
+        const translationId = crypto.randomUUID();
+        const layerId = crypto.randomUUID();
+        db.prepare(`UPDATE translations SET is_active = 0, updated_at = ? WHERE ocr_block_id = ? AND target_language = ?`).run(now, block.id, chapter.target_language || 'ko');
+        db.prepare(`UPDATE lettering_layers SET is_active = 0, updated_at = ? WHERE translation_id IN (SELECT id FROM translations WHERE ocr_block_id = ? AND target_language = ?)`).run(now, block.id, chapter.target_language || 'ko');
+        db.prepare(`INSERT INTO translations (id, ocr_block_id, source_language, target_language, translated_text, translator_id, translator_version, glossary_version, is_active, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, 'ctranslate2', ?, NULL, 1, ?, ?)`).run(
+          translationId,
+          block.id,
+          block.source_language || 'ja',
+          chapter.target_language || 'ko',
+          translatedText,
+          path.basename(config.aiTranslationModelPath),
+          now,
+          now,
+        );
+        db.prepare(`INSERT INTO lettering_layers (id, page_id, translation_id, polygon_json, text, style_json, is_active, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(
+          layerId,
+          block.page_id,
+          translationId,
+          block.polygon_json,
+          translatedText,
+          JSON.stringify(autoLetteringStyle(block)),
+          now,
+          now,
+        );
+      }
+    });
+    saveTranslations();
+    const finishedAt = new Date().toISOString();
+    db.prepare(`UPDATE jobs SET status = 'completed', current_stage = 'completed', progress = 100, finished_at = ?, error_message = NULL WHERE id = ?`).run(finishedAt, jobId);
+  } catch (error) {
+    if (!isJobCancelled(jobId)) await failAutoTranslationJob(jobId, error.message || '자동 번역에 실패했습니다.');
+  } finally {
+    activeAiProcesses.delete(jobId);
+  }
+}
+
+function autoLetteringStyle(block) {
+  const polygon = parseJson(block.polygon_json, []);
+  const points = polygon.filter((point) => Number.isFinite(Number(point.x)) && Number.isFinite(Number(point.y)));
+  if (!points.length) return normalizeLetteringStyle({ color: '#21121a', background: 'rgba(255, 255, 255, 0.92)' });
+  const xs = points.map((point) => Number(point.x));
+  const ys = points.map((point) => Number(point.y));
+  const width = Math.max(...xs) - Math.min(...xs);
+  const height = Math.max(...ys) - Math.min(...ys);
+  return normalizeLetteringStyle({
+    color: '#21121a',
+    background: 'rgba(255, 255, 255, 0.92)',
+    writingMode: height > width * 1.25 ? 'vertical-rl' : 'horizontal-tb',
+    fontSize: height > width * 1.25 ? 22 : 20,
+  });
+}
+
+function runTranslationWorker(jobId, payload, onProgress) {
+  return new Promise((resolve, reject) => {
+    if (!fs.existsSync(config.aiWorkerScript)) {
+      reject(new Error(`AI 워커 파일을 찾을 수 없습니다: ${config.aiWorkerScript}`));
+      return;
+    }
+    let child;
+    try {
+      child = spawn(config.aiWorkerCommand, [config.aiWorkerScript], {
+        cwd: ROOT,
+        windowsHide: true,
+        env: {
+          ...process.env,
+          AI_TRANSLATION_MODEL_PATH: config.aiTranslationModelPath,
+          AI_TRANSLATION_TOKENIZER_PATH: config.aiTranslationTokenizerPath,
+          AI_TRANSLATION_COMPUTE_TYPE: config.aiTranslationComputeType,
+          AI_WORKER_THREADS: String(config.aiWorkerThreads),
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      reject(new Error(`AI 워커를 시작하지 못했습니다: ${error.message}`));
+      return;
+    }
+    activeAiProcesses.set(jobId, child);
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let finished = false;
+    const results = [];
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    const handleLine = (line) => {
+      if (!line.trim()) return;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        fail(new Error(`AI 워커가 잘못된 응답을 반환했습니다: ${line.slice(0, 180)}`));
+        return;
+      }
+      if (event.type === 'progress') onProgress(Math.min(100, Math.max(0, Number(event.progress) || 0)));
+      if (event.type === 'result' && Number.isInteger(event.index)) results[event.index] = event;
+      if (event.type === 'error') fail(new Error(String(event.message || 'AI 워커가 실패했습니다.')));
+      if (event.type === 'done') finished = true;
+    };
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      const lines = stdout.split(/\r?\n/);
+      stdout = lines.pop() || '';
+      lines.forEach(handleLine);
+    });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', (error) => fail(new Error(`AI 워커를 실행하지 못했습니다: ${error.message}`)));
+    child.on('close', (code) => {
+      activeAiProcesses.delete(jobId);
+      if (settled) return;
+      if (code !== 0) { fail(new Error(stderr.trim().slice(-500) || `AI 워커가 종료되었습니다(${code}).`)); return; }
+      if (!finished) { fail(new Error('AI 워커가 완료 이벤트 없이 종료되었습니다.')); return; }
+      settled = true;
+      resolve(results);
+    });
+    child.stdin.end(`${JSON.stringify(payload)}\n`);
+  });
+}
+
+async function failAutoTranslationJob(jobId, message) {
   const current = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
   if (!current || current.status === 'cancelled') return;
   db.prepare(`UPDATE jobs SET status = 'failed', current_stage = 'failed', error_message = ?, finished_at = ? WHERE id = ?`).run(String(message).slice(0, 500), new Date().toISOString(), jobId);

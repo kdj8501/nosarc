@@ -5,5 +5,8 @@ data/*.db-*
 data/media/
 data/uploads/
 data/tesseract/
+data/models/
+ai-worker/.venv/
+__pycache__/
 test/*.png
 npm-debug.log*

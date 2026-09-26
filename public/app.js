@@ -71,6 +71,7 @@ async function openSeries(id) {
   document.querySelectorAll('[data-retry]').forEach((button) => button.addEventListener('click', () => retryJob(button.dataset.retry)));
   document.querySelectorAll('[data-cancel]').forEach((button) => button.addEventListener('click', () => cancelJob(button.dataset.cancel)));
   document.querySelectorAll('[data-ocr]').forEach((button) => button.addEventListener('click', () => startOcr(button.dataset.ocr)));
+  document.querySelectorAll('[data-auto-translate]').forEach((button) => button.addEventListener('click', () => startAutoTranslate(button.dataset.autoTranslate)));
 }
 
 function renderChapter(chapter) {
@@ -79,7 +80,8 @@ function renderChapter(chapter) {
   const status = readable ? `${chapter.page_count}페이지` : statusLabels[chapter.processing_status] || chapter.processing_status;
   const action = readable ? `<button class="button small primary" data-read="${chapter.id}">읽기</button>` : chapter.processing_status === 'failed' && chapter.job_id ? `<button class="button small primary" data-retry="${chapter.job_id}">재시도</button>` : ['queued', 'preparing'].includes(chapter.processing_status) && chapter.job_id ? `<button class="button small ghost" data-cancel="${chapter.job_id}">취소</button>` : `<button class="button small ghost" disabled>준비 중</button>`;
   const ocrAction = readable && chapter.job_type === 'ocr' && ['queued', 'running'].includes(chapter.job_status) ? `<button class="button small ghost" data-cancel="${chapter.job_id}">OCR 취소</button>` : readable && chapter.job_type === 'ocr' && chapter.job_status === 'failed' ? `<button class="button small ghost" data-retry="${chapter.job_id}">OCR 재시도</button>` : readable ? `<button class="button small ghost" data-ocr="${chapter.id}">OCR 실행</button>` : '';
-  return `<article class="chapter-row"><div><strong>${escapeHtml(chapter.number_label)}${chapter.title ? ` · ${escapeHtml(chapter.title)}` : ''}</strong><span class="muted">${escapeHtml(status)}</span></div><div class="chapter-actions">${action}${ocrAction}</div></article>`;
+  const autoTranslateAction = readable && chapter.ocr_block_count > 0 && chapter.job_type === 'auto_translate' && ['queued', 'running'].includes(chapter.job_status) ? `<button class="button small ghost" data-cancel="${chapter.job_id}">자동 역식 취소</button>` : readable && chapter.ocr_block_count > 0 && chapter.job_type === 'auto_translate' && chapter.job_status === 'failed' ? `<button class="button small ghost" data-retry="${chapter.job_id}">자동 역식 재시도</button>` : readable && chapter.ocr_block_count > 0 ? `<button class="button small ghost" data-auto-translate="${chapter.id}">자동 번역·식자</button>` : '';
+  return `<article class="chapter-row"><div><strong>${escapeHtml(chapter.number_label)}${chapter.title ? ` · ${escapeHtml(chapter.title)}` : ''}</strong><span class="muted">${escapeHtml(status)}${chapter.ocr_block_count ? ` · OCR ${chapter.ocr_block_count}개${chapter.translation_count ? ` · 번역 ${chapter.translation_count}개` : ''}` : ''}</span></div><div class="chapter-actions">${action}${ocrAction}${autoTranslateAction}</div></article>`;
 }
 
 async function retryJob(jobId) {
@@ -101,6 +103,16 @@ async function startOcr(chapterId) {
   const result = await request(`/api/chapters/${chapterId}/ocr`, { method: 'POST' });
   if (!result?.id) return;
   showNotice('OCR 작업을 접수했습니다.');
+  await openSeries(state.detailSeriesId);
+  watchJob(result.id);
+}
+
+async function startAutoTranslate(chapterId) {
+  const confirmed = window.confirm('OCR 결과를 기준으로 자동 번역과 식자 레이어를 생성합니다. 기존 번역은 새 결과로 교체됩니다. 계속할까요?');
+  if (!confirmed) return;
+  const result = await request(`/api/chapters/${chapterId}/auto-translate`, { method: 'POST' });
+  if (!result?.id) return;
+  showNotice('자동 번역·식자 작업을 접수했습니다.');
   await openSeries(state.detailSeriesId);
   watchJob(result.id);
 }
@@ -232,7 +244,8 @@ async function watchJob(jobId) {
   const job = await request(`/api/jobs/${jobId}`);
   if (!job) return;
   if (['completed', 'failed', 'cancelled'].includes(job.status)) {
-    const message = job.status === 'completed' ? '페이지 변환이 완료되었습니다.' : job.status === 'failed' ? `페이지 변환 실패: ${job.error_message || '원인을 확인해 주세요.'}` : '페이지 변환이 취소되었습니다.';
+    const jobLabel = job.type === 'ocr' ? 'OCR' : job.type === 'auto_translate' ? '자동 역식' : '페이지 변환';
+    const message = job.status === 'completed' ? `${jobLabel}이 완료되었습니다.` : job.status === 'failed' ? `${jobLabel} 실패: ${job.error_message || '원인을 확인해 주세요.'}` : `${jobLabel}이 취소되었습니다.`;
     showNotice(message, job.status !== 'completed');
     await loadSeries($('#search').value);
     if ($('#series-detail-dialog').open && state.detailSeriesId) await openSeries(state.detailSeriesId);
