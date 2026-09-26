@@ -41,7 +41,7 @@ npm start
 
 첫 OCR 실행 시 `jpn.traineddata`를 `data/tesseract/`에 내려받으며, 이 디렉터리는 Git에서 무시됩니다. 네트워크가 차단된 환경에서는 `OCR_LANG_PATH`로 미리 받은 언어 데이터를 지정하세요.
 
-자동 번역 워커는 Python 3.11 이상과 로컬 CTranslate2 모델이 필요합니다. N100·16GB 환경에서는 워커를 한 개만 실행하고 INT8 모델을 사용하도록 기본값을 둡니다.
+자동 번역 워커는 Python 3.11 이상과 로컬 CTranslate2 모델이 필요합니다. 번역은 기본 8개 블록씩 나눠 처리해 진행률을 갱신하며, N100·16GB 환경에서는 워커를 한 개만 실행하고 INT8 모델을 사용하도록 기본값을 둡니다. 배치 크기는 `.env`의 `AI_TRANSLATION_BATCH_SIZE`로 조정할 수 있습니다.
 
 ```powershell
 py -3.11 -m venv ai-worker/.venv

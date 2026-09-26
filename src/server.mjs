@@ -73,6 +73,7 @@ const config = {
   aiTranslationSourceCode: process.env.AI_TRANSLATION_SOURCE_CODE || 'jpn_Jpan',
   aiTranslationTargetCode: process.env.AI_TRANSLATION_TARGET_CODE || 'kor_Hang',
   aiTranslationComputeType: process.env.AI_TRANSLATION_COMPUTE_TYPE || 'int8',
+  aiTranslationBatchSize: Math.max(1, Number(process.env.AI_TRANSLATION_BATCH_SIZE || 8)),
   aiWorkerThreads: Math.max(1, Number(process.env.AI_WORKER_THREADS || 1)),
 };
 
@@ -1207,6 +1208,7 @@ function runAiWorkerProcess(jobId, payload, onEvent, extraEnv = {}) {
           AI_TRANSLATION_MODEL_PATH: config.aiTranslationModelPath,
           AI_TRANSLATION_TOKENIZER_PATH: config.aiTranslationTokenizerPath,
           AI_TRANSLATION_COMPUTE_TYPE: config.aiTranslationComputeType,
+          AI_TRANSLATION_BATCH_SIZE: String(config.aiTranslationBatchSize),
           AI_WORKER_THREADS: String(config.aiWorkerThreads),
           HF_HOME: config.ocrMangaCachePath,
           OCR_MANGA_MODEL: config.ocrMangaModel,

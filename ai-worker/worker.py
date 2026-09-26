@@ -44,6 +44,7 @@ def translate(request: dict[str, Any]) -> None:
     source_code = str(request.get("sourceCode", "jpn_Jpan"))
     target_code = str(request.get("targetCode", "kor_Hang"))
     threads = max(1, int(os.environ.get("AI_WORKER_THREADS", "1")))
+    batch_size = max(1, int(os.environ.get("AI_TRANSLATION_BATCH_SIZE", "8")))
     translator = ctranslate2.Translator(
         model_path,
         device="cpu",
@@ -65,25 +66,30 @@ def translate(request: dict[str, Any]) -> None:
         source_tokens = [tokenizer.convert_ids_to_tokens(tokenizer.encode(text, add_special_tokens=True)) for text in texts]
         target_prefix = None
     emit({"type": "progress", "stage": "translating", "progress": 10})
-    results = translator.translate_batch(
-        source_tokens,
-        beam_size=1,
-        batch_type="tokens",
-        max_batch_size=8,
-        target_prefix=target_prefix,
-        return_scores=False,
-    )
+    for start in range(0, len(source_tokens), batch_size):
+        end = min(len(source_tokens), start + batch_size)
+        batch_prefix = target_prefix[start:end] if target_prefix is not None else None
+        results = translator.translate_batch(
+            source_tokens[start:end],
+            beam_size=1,
+            batch_type="tokens",
+            max_batch_size=batch_size,
+            target_prefix=batch_prefix,
+            return_scores=False,
+        )
 
-    for index, result in enumerate(results):
-        hypothesis = result.hypotheses[0] if result.hypotheses else []
-        token_ids = tokenizer.convert_tokens_to_ids(hypothesis)
-        text = tokenizer.decode(token_ids, skip_special_tokens=True).strip()
-        emit({
-            "type": "result",
-            "index": index,
-            "text": text,
-            "progress": 10 + int(((index + 1) / len(texts)) * 85),
-        })
+        for offset, result in enumerate(results):
+            index = start + offset
+            hypothesis = result.hypotheses[0] if result.hypotheses else []
+            token_ids = tokenizer.convert_tokens_to_ids(hypothesis)
+            text = tokenizer.decode(token_ids, skip_special_tokens=True).strip()
+            emit({
+                "type": "result",
+                "index": index,
+                "text": text,
+                "progress": 10 + int(((index + 1) / len(texts)) * 85),
+            })
+        emit({"type": "progress", "stage": "translating", "progress": 10 + int((end / len(texts)) * 85)})
     emit({"type": "done", "progress": 100})
 
 
