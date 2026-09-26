@@ -44,13 +44,17 @@ npm start
 
 ```powershell
 py -3.11 -m venv ai-worker/.venv
-& .\ai-worker\.venv\Scripts\python.exe -m pip install -r ai-worker/requirements.txt
+& .\ai-worker\.venv\Scripts\python.exe -m pip install --upgrade pip
+& .\ai-worker\.venv\Scripts\python.exe -m pip install -r ai-worker/requirements-cpu.txt
 ```
 
-Hugging Face의 호환 Marian/OPUS-MT 일본어→한국어 모델을 `data/models/opus-mt-ja-ko`에 준비한 뒤 CTranslate2 형식으로 변환합니다. 모델 경로와 변환 방식은 `.env`의 `AI_TRANSLATION_MODEL_PATH`, `AI_TRANSLATION_TOKENIZER_PATH`로 바꿀 수 있습니다.
+`requirements-cpu.txt`는 CUDA를 설치하지 않고 CPU 전용 PyTorch를 사용합니다. 모델 변환기와 이후 Manga OCR 확장을 위해 PyTorch를 함께 설치합니다.
+
+기본 번역 모델은 일본어(`jpn_Jpan`)와 한국어(`kor_Hang`)를 지원하는 NLLB-200 distilled 600M이며, `data/models/nllb-200-distilled-600M`에 준비한 뒤 CTranslate2 형식으로 변환합니다. N100에서는 변환 후 INT8 모델만 실행합니다. 모델 경로와 언어 코드는 `.env`의 `AI_TRANSLATION_MODEL_PATH`, `AI_TRANSLATION_TOKENIZER_PATH`, `AI_TRANSLATION_SOURCE_CODE`, `AI_TRANSLATION_TARGET_CODE`로 바꿀 수 있습니다.
 
 ```powershell
-ct2-transformers-converter --model data/models/opus-mt-ja-ko --quantization int8 --output_dir data/models/opus-mt-ja-ko-ct2
+& .\ai-worker\.venv\Scripts\hf.exe download facebook/nllb-200-distilled-600M --local-dir data/models/nllb-200-distilled-600M
+& .\ai-worker\.venv\Scripts\ct2-transformers-converter.exe --model data/models/nllb-200-distilled-600M --quantization int8 --output_dir data/models/nllb-200-distilled-600M-ct2
 ```
 
 Python 실행 파일이 `python` 명령으로 연결되지 않으면 `.env`의 `AI_WORKER_COMMAND`에 가상 환경의 절대 경로를 지정하세요. 모델 파일과 가상 환경은 Git에 커밋되지 않습니다.

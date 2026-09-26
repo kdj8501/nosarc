@@ -14,8 +14,9 @@ from typing import Any
 
 
 def emit(payload: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    data = (json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8")
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
 
 
 def translate(request: dict[str, Any]) -> None:
@@ -39,6 +40,9 @@ def translate(request: dict[str, Any]) -> None:
         raise RuntimeError(f"번역 토크나이저 경로를 찾을 수 없습니다: {tokenizer_path}")
 
     compute_type = os.environ.get("AI_TRANSLATION_COMPUTE_TYPE", "int8")
+    model_family = os.environ.get("AI_TRANSLATION_MODEL_FAMILY", "nllb")
+    source_code = str(request.get("sourceCode", "jpn_Jpan"))
+    target_code = str(request.get("targetCode", "kor_Hang"))
     threads = max(1, int(os.environ.get("AI_WORKER_THREADS", "1")))
     translator = ctranslate2.Translator(
         model_path,
@@ -50,13 +54,23 @@ def translate(request: dict[str, Any]) -> None:
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
 
     emit({"type": "progress", "stage": "model-loaded", "progress": 5})
-    source_tokens = [tokenizer.convert_ids_to_tokens(tokenizer.encode(text, add_special_tokens=True)) for text in texts]
+    if model_family == "nllb":
+        source_tokens = []
+        for text in texts:
+            tokenizer.src_lang = source_code
+            tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(text, add_special_tokens=True))
+            source_tokens.append([source_code] + [token for token in tokens if token not in {source_code, "</s>"}] + ["</s>"])
+        target_prefix = [[target_code]] * len(texts)
+    else:
+        source_tokens = [tokenizer.convert_ids_to_tokens(tokenizer.encode(text, add_special_tokens=True)) for text in texts]
+        target_prefix = None
     emit({"type": "progress", "stage": "translating", "progress": 10})
     results = translator.translate_batch(
         source_tokens,
         beam_size=1,
         batch_type="tokens",
         max_batch_size=8,
+        target_prefix=target_prefix,
         return_scores=False,
     )
 
@@ -74,11 +88,11 @@ def translate(request: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    for line in sys.stdin:
-        if not line.strip():
+    for raw_line in sys.stdin.buffer:
+        if not raw_line.strip():
             continue
         try:
-            translate(json.loads(line))
+            translate(json.loads(raw_line.decode("utf-8")))
             return 0
         except Exception as error:  # noqa: BLE001 - send a safe message to Node.
             emit({"type": "error", "message": str(error)[:500]})

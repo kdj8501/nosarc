@@ -57,8 +57,11 @@ const config = {
   aiTranslationProvider: process.env.AI_TRANSLATION_PROVIDER || 'ctranslate2',
   aiWorkerCommand: process.env.AI_WORKER_COMMAND || 'python',
   aiWorkerScript: resolveFromRoot(process.env.AI_WORKER_SCRIPT || './ai-worker/worker.py'),
-  aiTranslationModelPath: resolveFromRoot(process.env.AI_TRANSLATION_MODEL_PATH || './data/models/opus-mt-ja-ko-ct2'),
-  aiTranslationTokenizerPath: resolveFromRoot(process.env.AI_TRANSLATION_TOKENIZER_PATH || './data/models/opus-mt-ja-ko'),
+  aiTranslationModelFamily: process.env.AI_TRANSLATION_MODEL_FAMILY || 'nllb',
+  aiTranslationModelPath: resolveFromRoot(process.env.AI_TRANSLATION_MODEL_PATH || './data/models/nllb-200-distilled-600M-ct2'),
+  aiTranslationTokenizerPath: resolveFromRoot(process.env.AI_TRANSLATION_TOKENIZER_PATH || './data/models/nllb-200-distilled-600M'),
+  aiTranslationSourceCode: process.env.AI_TRANSLATION_SOURCE_CODE || 'jpn_Jpan',
+  aiTranslationTargetCode: process.env.AI_TRANSLATION_TARGET_CODE || 'kor_Hang',
   aiTranslationComputeType: process.env.AI_TRANSLATION_COMPUTE_TYPE || 'int8',
   aiWorkerThreads: Math.max(1, Number(process.env.AI_WORKER_THREADS || 1)),
 };
@@ -765,6 +768,8 @@ async function runAutoTranslationJob(jobId) {
     const results = await runTranslationWorker(jobId, {
       sourceLanguage: 'ja',
       targetLanguage: chapter.target_language || 'ko',
+      sourceCode: config.aiTranslationSourceCode,
+      targetCode: config.aiTranslationTargetCode,
       texts: blocks.map((block) => block.source_text),
     }, (progress) => {
       db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(95, 5 + Math.round(progress * 0.9)), jobId);
@@ -845,6 +850,7 @@ function runTranslationWorker(jobId, payload, onProgress) {
         windowsHide: true,
         env: {
           ...process.env,
+          AI_TRANSLATION_MODEL_FAMILY: config.aiTranslationModelFamily,
           AI_TRANSLATION_MODEL_PATH: config.aiTranslationModelPath,
           AI_TRANSLATION_TOKENIZER_PATH: config.aiTranslationTokenizerPath,
           AI_TRANSLATION_COMPUTE_TYPE: config.aiTranslationComputeType,
