@@ -4,4 +4,5 @@ data/*.db
 data/*.db-*
 data/media/
 data/uploads/
+test/*.png
 npm-debug.log*
