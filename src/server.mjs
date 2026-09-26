@@ -54,6 +54,9 @@ const config = {
   ocrLangPath: process.env.OCR_LANG_PATH || '',
   ocrCachePath: resolveFromRoot(process.env.OCR_CACHE_PATH || './data/tesseract'),
   ocrMinConfidence: Number(process.env.OCR_MIN_CONFIDENCE || 0.15),
+  ocrMangaModel: process.env.OCR_MANGA_MODEL || 'kha-white/manga-ocr-base',
+  ocrMangaCachePath: resolveFromRoot(process.env.OCR_MANGA_CACHE_PATH || './data/models/huggingface'),
+  ocrMangaPadding: Number(process.env.OCR_MANGA_PADDING || 0.04),
   aiTranslationProvider: process.env.AI_TRANSLATION_PROVIDER || 'ctranslate2',
   aiWorkerCommand: process.env.AI_WORKER_COMMAND || 'python',
   aiWorkerScript: resolveFromRoot(process.env.AI_WORKER_SCRIPT || './ai-worker/worker.py'),
@@ -75,6 +78,7 @@ const uploadRoot = path.join(dataRoot, 'uploads');
 await fsp.mkdir(config.mediaRoot, { recursive: true });
 await fsp.mkdir(uploadRoot, { recursive: true });
 await fsp.mkdir(config.ocrCachePath, { recursive: true });
+await fsp.mkdir(config.ocrMangaCachePath, { recursive: true });
 await fsp.mkdir(path.dirname(config.aiTranslationModelPath), { recursive: true });
 
 const db = new Database(config.databasePath);
@@ -375,7 +379,7 @@ app.get('/api/chapters/:id', (req, res) => {
 app.post('/api/chapters/:id/ocr', (req, res) => {
   const chapter = db.prepare('SELECT * FROM chapters WHERE id = ?').get(req.params.id);
   if (!chapter) return res.status(404).json({ error: '권을 찾을 수 없습니다.' });
-  if (config.ocrProvider !== 'tesseract') return res.status(503).json({ error: `현재 OCR 제공자(${config.ocrProvider})는 사용할 수 없습니다.` });
+  if (!['tesseract', 'manga-ocr'].includes(config.ocrProvider)) return res.status(503).json({ error: `현재 OCR 제공자(${config.ocrProvider})는 사용할 수 없습니다.` });
   if (chapter.page_count < 1) return res.status(409).json({ error: 'OCR을 실행할 페이지가 없습니다.' });
   const activeJob = db.prepare(`SELECT * FROM jobs WHERE chapter_id = ? AND type = 'ocr' AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`).get(chapter.id);
   if (activeJob) return res.status(409).json({ error: '이미 OCR 작업이 진행 중입니다.', job_id: activeJob.id });
@@ -699,22 +703,32 @@ async function runOcrJob(jobId) {
   try {
     await clearOcrResults(job.chapter_id);
     worker = await createOcrWorker(config);
+    const detections = [];
     for (const [index, page] of pages.entries()) {
       if (isJobCancelled(jobId)) return;
       const data = await recognizePage(worker, assetPath(page));
       const blocks = extractOcrBlocks(data, page.width || 1, page.height || 1, { minConfidence: config.ocrMinConfidence });
-      const now = new Date().toISOString();
-      const insertBlocks = db.transaction(() => {
-        for (const block of blocks) {
-          db.prepare(`INSERT INTO ocr_blocks (id, page_id, polygon_json, source_text, source_language, confidence, reading_order, model_id, model_version, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'tesseract', 'tesseract.js', ?, ?)`).run(
-            crypto.randomUUID(), page.id, JSON.stringify(block.polygon), block.sourceText, config.ocrLanguage,
-            block.confidence, block.readingOrder, now, now,
-          );
-        }
+      detections.push({ page, blocks });
+      if (config.ocrProvider === 'tesseract') {
+        insertOcrBlocks(page, blocks, new Map(), 'tesseract', 'tesseract.js');
+      }
+      db.prepare('UPDATE jobs SET current_stage = ?, progress = ? WHERE id = ?').run(
+        config.ocrProvider === 'manga-ocr' ? 'detecting' : 'ocr',
+        config.ocrProvider === 'manga-ocr' ? Math.min(45, 5 + Math.round(((index + 1) / pages.length) * 40)) : Math.min(95, Math.round(((index + 1) / pages.length) * 95)),
+        jobId,
+      );
+    }
+    await worker.terminate().catch(() => undefined);
+    worker = null;
+
+    if (config.ocrProvider === 'manga-ocr' && detections.some((detection) => detection.blocks.length)) {
+      const recognized = await runMangaOcrWorker(jobId, detections, (progress) => {
+        db.prepare('UPDATE jobs SET current_stage = ?, progress = ? WHERE id = ?').run('recognizing', Math.min(95, 45 + Math.round(progress * 0.5)), jobId);
       });
-      insertBlocks();
-      db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(95, Math.round(((index + 1) / pages.length) * 95)), jobId);
+      if (isJobCancelled(jobId)) return;
+      for (const { page, blocks } of detections) {
+        insertOcrBlocks(page, blocks, recognized, 'manga-ocr', config.ocrMangaModel);
+      }
     }
     const finishedAt = new Date().toISOString();
     db.prepare(`UPDATE jobs SET status = 'completed', current_stage = 'completed', progress = 100, finished_at = ?, error_message = NULL WHERE id = ?`).run(finishedAt, jobId);
@@ -723,6 +737,22 @@ async function runOcrJob(jobId) {
   } finally {
     if (worker) await worker.terminate().catch(() => undefined);
   }
+}
+
+function insertOcrBlocks(page, blocks, recognized, modelId, modelVersion) {
+  const now = new Date().toISOString();
+  const insertBlocks = db.transaction(() => {
+    for (const [index, block] of blocks.entries()) {
+      const key = `${page.page_index}:${index}`;
+      const sourceText = recognized.get(key) || block.sourceText;
+      db.prepare(`INSERT INTO ocr_blocks (id, page_id, polygon_json, source_text, source_language, confidence, reading_order, model_id, model_version, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        crypto.randomUUID(), page.id, JSON.stringify(block.polygon), sourceText, config.ocrLanguage,
+        block.confidence, block.readingOrder, modelId, modelVersion, now, now,
+      );
+    }
+  });
+  insertBlocks();
 }
 
 async function clearOcrResults(chapterId) {
@@ -837,7 +867,7 @@ function autoLetteringStyle(block) {
   });
 }
 
-function runTranslationWorker(jobId, payload, onProgress) {
+function runAiWorkerProcess(jobId, payload, onEvent, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     if (!fs.existsSync(config.aiWorkerScript)) {
       reject(new Error(`AI 워커 파일을 찾을 수 없습니다: ${config.aiWorkerScript}`));
@@ -855,6 +885,10 @@ function runTranslationWorker(jobId, payload, onProgress) {
           AI_TRANSLATION_TOKENIZER_PATH: config.aiTranslationTokenizerPath,
           AI_TRANSLATION_COMPUTE_TYPE: config.aiTranslationComputeType,
           AI_WORKER_THREADS: String(config.aiWorkerThreads),
+          HF_HOME: config.ocrMangaCachePath,
+          OCR_MANGA_MODEL: config.ocrMangaModel,
+          OCR_MANGA_PADDING: String(config.ocrMangaPadding),
+          ...extraEnv,
         },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -867,7 +901,6 @@ function runTranslationWorker(jobId, payload, onProgress) {
     let stderr = '';
     let settled = false;
     let finished = false;
-    const results = [];
     const fail = (error) => {
       if (settled) return;
       settled = true;
@@ -882,8 +915,12 @@ function runTranslationWorker(jobId, payload, onProgress) {
         fail(new Error(`AI 워커가 잘못된 응답을 반환했습니다: ${line.slice(0, 180)}`));
         return;
       }
-      if (event.type === 'progress') onProgress(Math.min(100, Math.max(0, Number(event.progress) || 0)));
-      if (event.type === 'result' && Number.isInteger(event.index)) results[event.index] = event;
+      try {
+        onEvent(event);
+      } catch (error) {
+        fail(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
       if (event.type === 'error') fail(new Error(String(event.message || 'AI 워커가 실패했습니다.')));
       if (event.type === 'done') finished = true;
     };
@@ -900,13 +937,50 @@ function runTranslationWorker(jobId, payload, onProgress) {
     child.on('close', (code) => {
       activeAiProcesses.delete(jobId);
       if (settled) return;
+      if (stdout.trim()) handleLine(stdout.trim());
       if (code !== 0) { fail(new Error(stderr.trim().slice(-500) || `AI 워커가 종료되었습니다(${code}).`)); return; }
       if (!finished) { fail(new Error('AI 워커가 완료 이벤트 없이 종료되었습니다.')); return; }
       settled = true;
-      resolve(results);
+      resolve();
     });
-    child.stdin.end(`${JSON.stringify(payload)}\n`);
+    try {
+      child.stdin.end(`${JSON.stringify(payload)}\n`);
+    } catch (error) {
+      fail(new Error(`AI 워커 입력을 전달하지 못했습니다: ${error.message}`));
+    }
   });
+}
+
+function runTranslationWorker(jobId, payload, onProgress) {
+  const results = [];
+  return runAiWorkerProcess(jobId, payload, (event) => {
+    if (event.type === 'progress') {
+      onProgress(Math.min(100, Math.max(0, Number(event.progress) || 0)));
+    }
+    if (event.type === 'result' && Number.isInteger(event.index)) results[event.index] = event;
+  }).then(() => results);
+}
+
+async function runMangaOcrWorker(jobId, detections, onProgress) {
+  const results = new Map();
+  const pages = detections.map(({ page, blocks }) => ({
+    pageIndex: page.page_index,
+    imagePath: assetPath(page),
+    candidates: blocks.map((block, candidateIndex) => ({
+      candidateIndex,
+      polygon: block.polygon,
+    })),
+  }));
+  await runAiWorkerProcess(jobId, { kind: 'ocr', pages }, (event) => {
+    if (event.type === 'progress') {
+      onProgress(Math.min(100, Math.max(0, Number(event.progress) || 0)));
+    }
+    if (event.type === 'ocr_result' && Number.isInteger(event.pageIndex) && Number.isInteger(event.candidateIndex)) {
+      const text = String(event.text || '').trim();
+      if (text) results.set(`${event.pageIndex}:${event.candidateIndex}`, text);
+    }
+  });
+  return results;
 }
 
 async function failAutoTranslationJob(jobId, message) {
