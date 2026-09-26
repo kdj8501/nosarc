@@ -12,11 +12,14 @@
 - 이미지 권 리더와 원본/번역 전환 자리
 - PDF 페이지 렌더링과 CBZ/ZIP 이미지 추출
 - 단일 작업 큐, 진행률, 실패·취소·재시도 상태
+- OCR 블록·번역문·식자 레이어 저장 API와 리더 오버레이
 - PDF/CBZ 원본 업로드 접수 및 작업 상태 모델
 - 원본 파일과 페이지 파일을 보호된 `/media/:id`로 제공
 - 첫 번째 라이브러리 화면과 업로드 폼
 
-OCR, 번역, PDF/CBZ 페이지 변환은 다음 구현 단계에서 작업 큐와 연결합니다.
+실제 OCR 엔진은 서버별 모델 선택이 필요하므로 현재는 엔진 독립적인 OCR 블록·번역·식자 API를 먼저 제공합니다. 이후 Manga OCR/Argos 등의 어댑터가 이 계약으로 결과를 저장하게 됩니다.
+
+역식 데이터 API는 `POST /api/pages/:id/ocr-blocks`, `POST /api/ocr-blocks/:id/translations`, `PATCH /api/lettering-layers/:id`이며, 좌표는 페이지 기준 0~1 정규화 좌표를 사용합니다.
 
 ## 실행
 

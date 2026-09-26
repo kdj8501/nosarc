@@ -105,8 +105,8 @@ async function openReader(id) {
 function setReaderMode(mode) {
   if (!state.reader) return;
   if (mode === 'translated') {
-    showNotice('이 권에는 아직 번역 데이터가 없습니다.');
-    return;
+    const hasTranslation = state.reader.chapter.pages.some((page) => page.lettering_layers?.length);
+    if (!hasTranslation) { showNotice('이 권에는 아직 번역 데이터가 없습니다.'); return; }
   }
   state.reader.mode = mode;
   renderReader();
@@ -114,10 +114,41 @@ function setReaderMode(mode) {
 
 function renderReader() {
   const { chapter, mode } = state.reader;
+  const hasTranslation = chapter.pages.some((page) => page.lettering_layers?.length);
+  if (mode === 'translated' && !hasTranslation) state.reader.mode = 'original';
+  const activeMode = state.reader.mode;
   $('#reader-title').textContent = `${chapter.series_title} · ${chapter.number_label}${chapter.title ? ` · ${chapter.title}` : ''}`;
-  $('#reader-original').classList.toggle('active', mode === 'original');
-  $('#reader-notice').textContent = chapter.pages.length ? '원본 페이지를 표시하고 있습니다.' : '아직 변환된 페이지가 없습니다.';
-  $('#reader-stage').innerHTML = chapter.pages.length ? chapter.pages.map((page) => `<figure class="reader-page"><img src="${page.media_url}" alt="${escapeHtml(chapter.number_label)} 페이지 ${page.page_index + 1}" loading="lazy" /><figcaption>${page.page_index + 1} / ${chapter.pages.length}</figcaption></figure>`).join('') : '<div class="reader-empty"><p>페이지가 준비되면 이곳에서 읽을 수 있습니다.</p></div>';
+  $('#reader-original').classList.toggle('active', activeMode === 'original');
+  $('#reader-translated').classList.toggle('active', activeMode === 'translated');
+  $('#reader-translated').disabled = !hasTranslation;
+  $('#reader-notice').textContent = chapter.pages.length ? activeMode === 'translated' ? '번역문과 식자 레이어를 표시하고 있습니다.' : '원본 페이지를 표시하고 있습니다.' : '아직 변환된 페이지가 없습니다.';
+  $('#reader-stage').innerHTML = chapter.pages.length ? chapter.pages.map((page) => {
+    const layers = activeMode === 'translated' ? (page.lettering_layers || []).map(renderLetteringLayer).join('') : '';
+    return `<figure class="reader-page"><div class="reader-canvas"><img src="${page.media_url}" alt="${escapeHtml(chapter.number_label)} 페이지 ${page.page_index + 1}" loading="lazy" />${layers}</div><figcaption>${page.page_index + 1} / ${chapter.pages.length}</figcaption></figure>`;
+  }).join('') : '<div class="reader-empty"><p>페이지가 준비되면 이곳에서 읽을 수 있습니다.</p></div>';
+}
+
+function renderLetteringLayer(layer) {
+  const bounds = polygonBounds(layer.polygon);
+  const style = layer.style || {};
+  const fontSize = Math.min(96, Math.max(8, Number(style.fontSize) || 24));
+  const color = /^#[0-9a-f]{6}$/i.test(style.color || '') ? style.color : '#ffffff';
+  const background = /^rgba?\([0-9.,% ]+\)$/.test(style.background || '') ? style.background : 'rgba(20, 14, 25, 0.72)';
+  const writingMode = ['vertical-rl', 'horizontal-tb'].includes(style.writingMode) ? style.writingMode : 'vertical-rl';
+  const textAlign = ['center', 'left', 'right'].includes(style.textAlign) ? style.textAlign : 'center';
+  const fontWeight = ['400', '600', '700'].includes(String(style.fontWeight)) ? style.fontWeight : '600';
+  const css = `left:${bounds.left}%;top:${bounds.top}%;width:${bounds.width}%;height:${bounds.height}%;font-size:${fontSize}px;color:${color};background:${background};writing-mode:${writingMode};text-align:${textAlign};font-weight:${fontWeight};`;
+  return `<div class="lettering-layer" style="${css}">${escapeHtml(layer.text).replaceAll('\n', '<br />')}</div>`;
+}
+
+function polygonBounds(polygon = []) {
+  const points = polygon.filter((point) => Number.isFinite(Number(point.x)) && Number.isFinite(Number(point.y)));
+  if (!points.length) return { left: 0, top: 0, width: 100, height: 100 };
+  const xs = points.map((point) => Number(point.x));
+  const ys = points.map((point) => Number(point.y));
+  const left = Math.min(...xs) * 100;
+  const top = Math.min(...ys) * 100;
+  return { left, top, width: Math.max(1, Math.max(...xs) * 100 - left), height: Math.max(1, Math.max(...ys) * 100 - top) };
 }
 
 async function createSeries(event) {

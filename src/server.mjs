@@ -113,6 +113,43 @@ db.exec(`
     height INTEGER,
     UNIQUE(chapter_id, page_index)
   );
+  CREATE TABLE IF NOT EXISTS ocr_blocks (
+    id TEXT PRIMARY KEY,
+    page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+    polygon_json TEXT NOT NULL,
+    source_text TEXT NOT NULL,
+    source_language TEXT NOT NULL DEFAULT 'ja',
+    confidence REAL,
+    reading_order INTEGER NOT NULL DEFAULT 0,
+    model_id TEXT,
+    model_version TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS translations (
+    id TEXT PRIMARY KEY,
+    ocr_block_id TEXT NOT NULL REFERENCES ocr_blocks(id) ON DELETE CASCADE,
+    source_language TEXT NOT NULL,
+    target_language TEXT NOT NULL,
+    translated_text TEXT NOT NULL,
+    translator_id TEXT,
+    translator_version TEXT,
+    glossary_version TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS lettering_layers (
+    id TEXT PRIMARY KEY,
+    page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+    translation_id TEXT REFERENCES translations(id) ON DELETE SET NULL,
+    polygon_json TEXT NOT NULL,
+    text TEXT NOT NULL,
+    style_json TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
     chapter_id TEXT NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
@@ -311,6 +348,122 @@ app.get('/api/chapters/:id', (req, res) => {
   res.json(chapter);
 });
 
+app.post('/api/pages/:id/ocr-blocks', (req, res) => {
+  const page = db.prepare(`SELECT p.id FROM pages p WHERE p.id = ?`).get(req.params.id);
+  if (!page) return res.status(404).json({ error: '페이지를 찾을 수 없습니다.' });
+  const sourceText = String(req.body?.sourceText || '').trim();
+  if (!sourceText) return res.status(400).json({ error: 'OCR 원문을 입력해 주세요.' });
+  let polygon;
+  try {
+    polygon = normalizePolygon(req.body?.polygon);
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+  const now = new Date().toISOString();
+  const id = crypto.randomUUID();
+  db.prepare(`INSERT INTO ocr_blocks (id, page_id, polygon_json, source_text, source_language, confidence, reading_order, model_id, model_version, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    id,
+    page.id,
+    JSON.stringify(polygon),
+    sourceText,
+    normalizeLanguage(req.body?.sourceLanguage, 'ja'),
+    normalizeConfidence(req.body?.confidence),
+    Number.isInteger(req.body?.readingOrder) ? req.body.readingOrder : 0,
+    cleanOptional(req.body?.modelId),
+    cleanOptional(req.body?.modelVersion),
+    now,
+    now,
+  );
+  res.status(201).json(getOcrBlock(id));
+});
+
+app.patch('/api/ocr-blocks/:id', (req, res) => {
+  const current = getOcrBlock(req.params.id);
+  if (!current) return res.status(404).json({ error: 'OCR 블록을 찾을 수 없습니다.' });
+  let polygon = current.polygon;
+  if (req.body?.polygon !== undefined) {
+    try {
+      polygon = normalizePolygon(req.body.polygon);
+    } catch (error) {
+      return res.status(400).json({ error: error.message });
+    }
+  }
+  const sourceText = String(req.body?.sourceText ?? current.source_text).trim();
+  if (!sourceText) return res.status(400).json({ error: 'OCR 원문을 입력해 주세요.' });
+  const now = new Date().toISOString();
+  db.prepare(`UPDATE ocr_blocks SET polygon_json = ?, source_text = ?, confidence = ?, reading_order = ?, updated_at = ? WHERE id = ?`).run(
+    JSON.stringify(polygon),
+    sourceText,
+    normalizeConfidence(req.body?.confidence ?? current.confidence),
+    Number.isInteger(req.body?.readingOrder) ? req.body.readingOrder : current.reading_order,
+    now,
+    req.params.id,
+  );
+  db.prepare(`UPDATE lettering_layers SET polygon_json = ?, updated_at = ? WHERE translation_id IN (SELECT id FROM translations WHERE ocr_block_id = ? AND is_active = 1)`).run(JSON.stringify(polygon), now, req.params.id);
+  res.json(getOcrBlock(req.params.id));
+});
+
+app.post('/api/ocr-blocks/:id/translations', (req, res) => {
+  const block = db.prepare(`SELECT b.*, s.target_language AS series_target_language FROM ocr_blocks b
+    JOIN pages p ON p.id = b.page_id JOIN chapters c ON c.id = p.chapter_id JOIN series s ON s.id = c.series_id
+    WHERE b.id = ?`).get(req.params.id);
+  if (!block) return res.status(404).json({ error: 'OCR 블록을 찾을 수 없습니다.' });
+  const translatedText = String(req.body?.translatedText || '').trim();
+  if (!translatedText) return res.status(400).json({ error: '번역문을 입력해 주세요.' });
+  const targetLanguage = normalizeLanguage(req.body?.targetLanguage, block.series_target_language || 'ko');
+  const style = normalizeLetteringStyle(req.body?.style);
+  const now = new Date().toISOString();
+  const translationId = crypto.randomUUID();
+  const layerId = crypto.randomUUID();
+  const create = db.transaction(() => {
+    db.prepare(`UPDATE translations SET is_active = 0, updated_at = ? WHERE ocr_block_id = ? AND target_language = ?`).run(now, block.id, targetLanguage);
+    db.prepare(`UPDATE lettering_layers SET is_active = 0, updated_at = ? WHERE translation_id IN (SELECT id FROM translations WHERE ocr_block_id = ? AND target_language = ?)`).run(now, block.id, targetLanguage);
+    db.prepare(`INSERT INTO translations (id, ocr_block_id, source_language, target_language, translated_text, translator_id, translator_version, glossary_version, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(
+      translationId,
+      block.id,
+      block.source_language,
+      targetLanguage,
+      translatedText,
+      cleanOptional(req.body?.translatorId),
+      cleanOptional(req.body?.translatorVersion),
+      cleanOptional(req.body?.glossaryVersion),
+      now,
+      now,
+    );
+    db.prepare(`INSERT INTO lettering_layers (id, page_id, translation_id, polygon_json, text, style_json, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(layerId, block.page_id, translationId, block.polygon_json, translatedText, JSON.stringify(style), now, now);
+  });
+  create();
+  res.status(201).json(getTranslation(translationId));
+});
+
+app.patch('/api/lettering-layers/:id', (req, res) => {
+  const current = getLetteringLayer(req.params.id);
+  if (!current) return res.status(404).json({ error: '식자 레이어를 찾을 수 없습니다.' });
+  let polygon = current.polygon;
+  if (req.body?.polygon !== undefined) {
+    try {
+      polygon = normalizePolygon(req.body.polygon);
+    } catch (error) {
+      return res.status(400).json({ error: error.message });
+    }
+  }
+  const text = String(req.body?.text ?? current.text).trim();
+  if (!text) return res.status(400).json({ error: '식자 문구를 입력해 주세요.' });
+  const style = req.body?.style === undefined ? current.style : normalizeLetteringStyle(req.body.style);
+  db.prepare(`UPDATE lettering_layers SET polygon_json = ?, text = ?, style_json = ?, is_active = ?, updated_at = ? WHERE id = ?`).run(
+    JSON.stringify(polygon),
+    text,
+    JSON.stringify(style),
+    req.body?.visible === false ? 0 : current.is_active,
+    new Date().toISOString(),
+    req.params.id,
+  );
+  res.json(getLetteringLayer(req.params.id));
+});
+
 app.get('/api/jobs/:id', (req, res) => {
   const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(req.params.id);
   if (!job) return res.status(404).json({ error: '작업을 찾을 수 없습니다.' });
@@ -405,10 +558,57 @@ function getChapter(id) {
   const chapter = db.prepare(`SELECT c.*, s.title AS series_title, a.original_name AS source_name FROM chapters c
     JOIN series s ON s.id = c.series_id JOIN assets a ON a.id = c.source_asset_id WHERE c.id = ?`).get(id);
   if (!chapter) return null;
-  chapter.pages = db.prepare(`SELECT p.*, a.mime_type, a.original_name, a.id AS asset_id FROM pages p JOIN assets a ON a.id = p.image_asset_id
-    WHERE p.chapter_id = ? ORDER BY p.page_index`).all(id).map((page) => ({ ...page, media_url: `/media/${page.asset_id}` }));
+  const pages = db.prepare(`SELECT p.*, a.mime_type, a.original_name, a.id AS asset_id FROM pages p JOIN assets a ON a.id = p.image_asset_id
+    WHERE p.chapter_id = ? ORDER BY p.page_index`).all(id);
+  const blocks = db.prepare(`SELECT b.* FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ? ORDER BY b.reading_order, b.created_at`).all(id).map(serializeOcrBlock);
+  const translations = db.prepare(`SELECT t.* FROM translations t JOIN ocr_blocks b ON b.id = t.ocr_block_id JOIN pages p ON p.id = b.page_id
+    WHERE p.chapter_id = ? AND t.is_active = 1`).all(id).map(serializeTranslation);
+  const layers = db.prepare(`SELECT l.* FROM lettering_layers l JOIN pages p ON p.id = l.page_id WHERE p.chapter_id = ? AND l.is_active = 1 ORDER BY l.created_at`).all(id).map(serializeLetteringLayer);
+  const blocksByPage = groupBy(blocks, 'page_id');
+  const translationsByBlock = groupBy(translations, 'ocr_block_id');
+  const layersByPage = groupBy(layers, 'page_id');
+  chapter.pages = pages.map((page) => ({
+    ...page,
+    media_url: `/media/${page.asset_id}`,
+    ocr_blocks: (blocksByPage[page.id] || []).map((block) => ({ ...block, translation: translationsByBlock[block.id]?.[0] || null })),
+    lettering_layers: layersByPage[page.id] || [],
+  }));
   chapter.job = db.prepare(`SELECT * FROM jobs WHERE chapter_id = ? ORDER BY created_at DESC LIMIT 1`).get(id) || null;
   return chapter;
+}
+
+function getOcrBlock(id) {
+  const block = db.prepare('SELECT * FROM ocr_blocks WHERE id = ?').get(id);
+  return block ? serializeOcrBlock(block) : null;
+}
+
+function getTranslation(id) {
+  const translation = db.prepare('SELECT * FROM translations WHERE id = ?').get(id);
+  return translation ? serializeTranslation(translation) : null;
+}
+
+function getLetteringLayer(id) {
+  const layer = db.prepare('SELECT * FROM lettering_layers WHERE id = ?').get(id);
+  return layer ? serializeLetteringLayer(layer) : null;
+}
+
+function serializeOcrBlock(block) {
+  return { ...block, polygon: parseJson(block.polygon_json, []) };
+}
+
+function serializeTranslation(translation) {
+  return { ...translation };
+}
+
+function serializeLetteringLayer(layer) {
+  return { ...layer, polygon: parseJson(layer.polygon_json, []), style: parseJson(layer.style_json, {}) };
+}
+
+function groupBy(rows, key) {
+  return rows.reduce((groups, row) => {
+    (groups[row[key]] ||= []).push(row);
+    return groups;
+  }, {});
 }
 
 function enqueueIngest(jobId) {
@@ -655,6 +855,51 @@ function parseSortKey(value) {
 function cleanOptional(value) {
   const text = value == null ? '' : String(value).trim();
   return text || null;
+}
+
+function parseJson(value, fallback) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizePolygon(value) {
+  const polygon = typeof value === 'string' ? parseJson(value, null) : value;
+  if (!Array.isArray(polygon) || polygon.length < 3 || polygon.length > 16) throw new Error('다각형 좌표는 3~16개의 점이어야 합니다.');
+  return polygon.map((point) => {
+    const x = Number(Array.isArray(point) ? point[0] : point?.x);
+    const y = Number(Array.isArray(point) ? point[1] : point?.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) throw new Error('다각형 좌표는 0~1 사이의 정규화 좌표여야 합니다.');
+    return { x, y };
+  });
+}
+
+function normalizeLanguage(value, fallback) {
+  const language = String(value || fallback).trim().toLowerCase();
+  return /^[a-z]{2,10}(?:-[a-z]{2,8})?$/.test(language) ? language : fallback;
+}
+
+function normalizeConfidence(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const confidence = Number(value);
+  return Number.isFinite(confidence) ? Math.min(1, Math.max(0, confidence)) : null;
+}
+
+function normalizeLetteringStyle(value) {
+  const input = typeof value === 'string' ? parseJson(value, {}) : (value || {});
+  const fontSize = Number(input.fontSize);
+  const color = /^#[0-9a-f]{6}$/i.test(String(input.color || '')) ? String(input.color) : '#ffffff';
+  const background = /^rgba?\([0-9.,% ]+\)$/.test(String(input.background || '')) ? String(input.background) : 'rgba(20, 14, 25, 0.72)';
+  return {
+    fontSize: Number.isFinite(fontSize) ? Math.min(96, Math.max(8, fontSize)) : 24,
+    color,
+    background,
+    writingMode: ['vertical-rl', 'horizontal-tb'].includes(input.writingMode) ? input.writingMode : 'vertical-rl',
+    textAlign: ['center', 'left', 'right'].includes(input.textAlign) ? input.textAlign : 'center',
+    fontWeight: ['400', '600', '700'].includes(String(input.fontWeight)) ? String(input.fontWeight) : '600',
+  };
 }
 
 function slugify(value) {
