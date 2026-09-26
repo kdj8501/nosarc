@@ -1,4 +1,4 @@
-const state = { series: [] };
+const state = { series: [], reader: null };
 const $ = (selector) => document.querySelector(selector);
 
 document.addEventListener('DOMContentLoaded', boot);
@@ -12,6 +12,10 @@ async function boot() {
   $('#new-series').addEventListener('click', () => $('#series-dialog').showModal());
   $('#series-form').addEventListener('submit', createSeries);
   $('#chapter-form').addEventListener('submit', uploadChapter);
+  $('#series-detail-close').addEventListener('click', () => $('#series-detail-dialog').close());
+  $('#reader-close').addEventListener('click', () => $('#reader-dialog').close());
+  $('#reader-original').addEventListener('click', () => setReaderMode('original'));
+  $('#reader-translated').addEventListener('click', () => setReaderMode('translated'));
   $('#search').addEventListener('input', () => loadSeries($('#search').value));
 }
 
@@ -38,6 +42,7 @@ async function loadSeries(search = '') {
   state.series = series;
   $('#series-list').innerHTML = series.length ? series.map(renderSeries).join('') : '<div class="series-card"><p class="muted">아직 작품이 없습니다. 첫 작품을 추가해 보세요.</p></div>';
   document.querySelectorAll('[data-upload]').forEach((button) => button.addEventListener('click', () => openChapter(button.dataset.upload, button.dataset.title)));
+  document.querySelectorAll('[data-open]').forEach((button) => button.addEventListener('click', () => openSeries(button.dataset.open)));
 }
 
 function renderSeries(item) {
@@ -49,6 +54,50 @@ function openChapter(id, title) {
   $('#chapter-series-id').value = id;
   $('#chapter-dialog-title').textContent = `${title} · 권 업로드`;
   $('#chapter-dialog').showModal();
+}
+
+async function openSeries(id) {
+  const series = await request(`/api/series/${id}`);
+  if (!series) return;
+  $('#series-detail-title').textContent = series.title;
+  $('#series-detail-description').textContent = series.description || '작품 설명이 없습니다.';
+  $('#series-detail-tags').innerHTML = series.tags ? series.tags.split(', ').map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join('') : '';
+  $('#series-detail-count').textContent = `${series.chapters.length}개`;
+  $('#chapter-list').innerHTML = series.chapters.length ? series.chapters.map(renderChapter).join('') : '<p class="muted">등록된 권이 없습니다.</p>';
+  $('#series-detail-dialog').showModal();
+  document.querySelectorAll('[data-read]').forEach((button) => button.addEventListener('click', () => openReader(button.dataset.read)));
+}
+
+function renderChapter(chapter) {
+  const readable = chapter.page_count > 0 && chapter.processing_status === 'completed';
+  const status = readable ? `${chapter.page_count}페이지` : chapter.processing_status === 'preparing' ? '변환 대기' : chapter.processing_status;
+  return `<article class="chapter-row"><div><strong>${escapeHtml(chapter.number_label)}${chapter.title ? ` · ${escapeHtml(chapter.title)}` : ''}</strong><span class="muted">${escapeHtml(status)}</span></div><button class="button small ${readable ? 'primary' : 'ghost'}" data-read="${chapter.id}" ${readable ? '' : 'disabled'}>${readable ? '읽기' : '준비 중'}</button></article>`;
+}
+
+async function openReader(id) {
+  const chapter = await request(`/api/chapters/${id}`);
+  if (!chapter) return;
+  state.reader = { chapter, mode: 'original' };
+  $('#reader-dialog').showModal();
+  renderReader();
+}
+
+function setReaderMode(mode) {
+  if (!state.reader) return;
+  if (mode === 'translated') {
+    showNotice('이 권에는 아직 번역 데이터가 없습니다.');
+    return;
+  }
+  state.reader.mode = mode;
+  renderReader();
+}
+
+function renderReader() {
+  const { chapter, mode } = state.reader;
+  $('#reader-title').textContent = `${chapter.series_title} · ${chapter.number_label}${chapter.title ? ` · ${chapter.title}` : ''}`;
+  $('#reader-original').classList.toggle('active', mode === 'original');
+  $('#reader-notice').textContent = chapter.pages.length ? '원본 페이지를 표시하고 있습니다.' : '아직 변환된 페이지가 없습니다.';
+  $('#reader-stage').innerHTML = chapter.pages.length ? chapter.pages.map((page) => `<figure class="reader-page"><img src="${page.media_url}" alt="${escapeHtml(chapter.number_label)} 페이지 ${page.page_index + 1}" loading="lazy" /><figcaption>${page.page_index + 1} / ${chapter.pages.length}</figcaption></figure>`).join('') : '<div class="reader-empty"><p>페이지가 준비되면 이곳에서 읽을 수 있습니다.</p></div>';
 }
 
 async function createSeries(event) {

@@ -76,6 +76,27 @@
         <div class="dialog-actions"><button class="button ghost" value="cancel">취소</button><button class="button primary" value="default">업로드</button></div>
       </form>
     </dialog>
+
+    <dialog id="series-detail-dialog" class="detail-dialog">
+      <div class="detail-card">
+        <div class="dialog-header"><div><p class="eyebrow">SERIES</p><h2 id="series-detail-title"></h2></div><button id="series-detail-close" class="icon-button" type="button" aria-label="닫기">×</button></div>
+        <p id="series-detail-description" class="muted"></p>
+        <div id="series-detail-tags"></div>
+        <div class="section-heading"><h3>권 목록</h3><span id="series-detail-count" class="muted"></span></div>
+        <div id="chapter-list" class="chapter-list"></div>
+      </div>
+    </dialog>
+
+    <dialog id="reader-dialog" class="reader-dialog">
+      <div class="reader-card">
+        <header class="reader-header">
+          <div><p class="eyebrow">READER</p><h2 id="reader-title"></h2></div>
+          <div class="reader-actions"><button id="reader-original" class="button small active" type="button">원본</button><button id="reader-translated" class="button small" type="button" disabled title="번역 데이터가 아직 없습니다.">번역</button><button id="reader-close" class="icon-button" type="button" aria-label="닫기">×</button></div>
+        </header>
+        <p id="reader-notice" class="reader-notice"></p>
+        <div id="reader-stage" class="reader-stage"></div>
+      </div>
+    </dialog>
     <script type="module" src="/app.js"></script>
   </body>
 </html>
