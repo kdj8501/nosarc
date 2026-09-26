@@ -16,6 +16,7 @@ async function boot() {
   $('#reader-close').addEventListener('click', () => $('#reader-dialog').close());
   $('#reader-original').addEventListener('click', () => setReaderMode('original'));
   $('#reader-translated').addEventListener('click', () => setReaderMode('translated'));
+  $('#reader-editor-toggle').addEventListener('click', toggleTranslationEditor);
   $('#search').addEventListener('input', () => loadSeries($('#search').value));
 }
 
@@ -108,6 +109,8 @@ async function openReader(id) {
   const chapter = await request(`/api/chapters/${id}`);
   if (!chapter) return;
   state.reader = { chapter, mode: 'original' };
+  $('#translation-editor').hidden = true;
+  $('#reader-editor-toggle').classList.remove('active');
   $('#reader-dialog').showModal();
   renderReader();
 }
@@ -131,11 +134,14 @@ function renderReader() {
   $('#reader-original').classList.toggle('active', activeMode === 'original');
   $('#reader-translated').classList.toggle('active', activeMode === 'translated');
   $('#reader-translated').disabled = !hasTranslation;
+  const hasBlocks = chapter.pages.some((page) => page.ocr_blocks?.length);
+  $('#reader-editor-toggle').disabled = !hasBlocks;
   $('#reader-notice').textContent = chapter.pages.length ? activeMode === 'translated' ? '번역문과 식자 레이어를 표시하고 있습니다.' : '원본 페이지를 표시하고 있습니다.' : '아직 변환된 페이지가 없습니다.';
   $('#reader-stage').innerHTML = chapter.pages.length ? chapter.pages.map((page) => {
     const layers = activeMode === 'translated' ? (page.lettering_layers || []).map(renderLetteringLayer).join('') : '';
     return `<figure class="reader-page"><div class="reader-canvas"><img src="${page.media_url}" alt="${escapeHtml(chapter.number_label)} 페이지 ${page.page_index + 1}" loading="lazy" />${layers}</div><figcaption>${page.page_index + 1} / ${chapter.pages.length}</figcaption></figure>`;
   }).join('') : '<div class="reader-empty"><p>페이지가 준비되면 이곳에서 읽을 수 있습니다.</p></div>';
+  renderTranslationEditor();
 }
 
 function renderLetteringLayer(layer) {
@@ -159,6 +165,38 @@ function polygonBounds(polygon = []) {
   const left = Math.min(...xs) * 100;
   const top = Math.min(...ys) * 100;
   return { left, top, width: Math.max(1, Math.max(...xs) * 100 - left), height: Math.max(1, Math.max(...ys) * 100 - top) };
+}
+
+function toggleTranslationEditor() {
+  const editor = $('#translation-editor');
+  editor.hidden = !editor.hidden;
+  $('#reader-editor-toggle').classList.toggle('active', !editor.hidden);
+}
+
+function renderTranslationEditor() {
+  const editor = $('#translation-editor');
+  if (!state.reader) return;
+  const entries = state.reader.chapter.pages.flatMap((page, pageIndex) => (page.ocr_blocks || []).map((block) => ({ page, pageIndex, block })));
+  $('#translation-editor-count').textContent = `${entries.length}개 블록`;
+  $('#translation-editor-list').innerHTML = entries.length ? entries.map(({ page, pageIndex, block }) => {
+    const layer = (page.lettering_layers || []).find((candidate) => candidate.translation_id === block.translation?.id);
+    const style = layer?.style || {};
+    return `<article class="translation-entry"><div class="translation-source"><span class="eyebrow">PAGE ${pageIndex + 1}</span><p>${escapeHtml(block.source_text)}</p><span class="muted">신뢰도 ${block.confidence == null ? '-' : `${Math.round(block.confidence * 100)}%`}</span></div><textarea data-translation-text="${block.id}" rows="2" placeholder="번역문을 입력하세요.">${escapeHtml(block.translation?.translated_text || '')}</textarea><div class="translation-controls"><select data-writing-mode="${block.id}" aria-label="쓰기 방향"><option value="vertical-rl" ${style.writingMode !== 'horizontal-tb' ? 'selected' : ''}>세로쓰기</option><option value="horizontal-tb" ${style.writingMode === 'horizontal-tb' ? 'selected' : ''}>가로쓰기</option></select><input data-font-size="${block.id}" type="number" min="8" max="96" value="${Number(style.fontSize) || 24}" aria-label="글자 크기" /><span class="muted">px</span><button class="button small primary" data-save-translation="${block.id}">저장</button></div></article>`;
+  }).join('') : '<p class="muted">OCR 블록이 없습니다. 먼저 OCR을 실행해 주세요.</p>';
+  document.querySelectorAll('[data-save-translation]').forEach((button) => button.addEventListener('click', () => saveTranslation(button.dataset.saveTranslation)));
+}
+
+async function saveTranslation(blockId) {
+  const text = document.querySelector(`[data-translation-text="${blockId}"]`).value.trim();
+  const writingMode = document.querySelector(`[data-writing-mode="${blockId}"]`).value;
+  const fontSize = Number(document.querySelector(`[data-font-size="${blockId}"]`).value);
+  const result = await request(`/api/ocr-blocks/${blockId}/translations`, { method: 'POST', body: { translatedText: text, targetLanguage: state.reader.chapter.target_language, style: { writingMode, fontSize } } });
+  if (!result) return;
+  state.reader.chapter = await request(`/api/chapters/${state.reader.chapter.id}`);
+  renderReader();
+  $('#translation-editor').hidden = false;
+  $('#reader-editor-toggle').classList.add('active');
+  showNotice('번역과 식자 레이어를 저장했습니다.');
 }
 
 async function createSeries(event) {

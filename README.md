@@ -14,13 +14,14 @@
 - 단일 작업 큐, 진행률, 실패·취소·재시도 상태
 - OCR 블록·번역문·식자 레이어 저장 API와 리더 오버레이
 - Tesseract.js 기반 일본어 OCR 작업과 진행 상태
+- 리더 안에서 OCR 블록별 번역문과 기본 식자 스타일 편집
 - PDF/CBZ 원본 업로드 접수 및 작업 상태 모델
 - 원본 파일과 페이지 파일을 보호된 `/media/:id`로 제공
 - 첫 번째 라이브러리 화면과 업로드 폼
 
 현재 OCR 엔진은 Tesseract.js 기반 일본어 인식(`OCR_LANGUAGE=jpn`)이며, 서버별 모델 선택을 위해 어댑터 경계를 유지합니다. 이후 Manga OCR/Argos 등의 어댑터가 같은 계약으로 결과를 저장할 수 있습니다.
 
-역식 데이터 API는 `POST /api/pages/:id/ocr-blocks`, `POST /api/ocr-blocks/:id/translations`, `PATCH /api/lettering-layers/:id`이며, 좌표는 페이지 기준 0~1 정규화 좌표를 사용합니다.
+리더에서 `번역 편집`을 누르면 OCR 블록별 번역문을 입력하고 세로쓰기/가로쓰기와 글자 크기를 저장할 수 있습니다. 저장된 결과는 번역 모드의 식자 레이어로 표시됩니다. 역식 데이터 API는 `POST /api/pages/:id/ocr-blocks`, `POST /api/ocr-blocks/:id/translations`, `PATCH /api/lettering-layers/:id`이며, 좌표는 페이지 기준 0~1 정규화 좌표를 사용합니다.
 
 ## 실행
 

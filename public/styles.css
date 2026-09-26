@@ -72,6 +72,20 @@ dialog::backdrop { background: #08070cb8; backdrop-filter: blur(3px); }
 .reader-header h2 { margin: 5px 0 0; font-size: 20px; }
 .reader-actions { flex-shrink: 0; }
 .reader-notice { min-height: 22px; margin: 12px 0; color: var(--muted); font-size: 13px; }
+.translation-editor { flex: 0 0 auto; max-height: 330px; margin-bottom: 12px; padding: 14px; overflow: auto; border: 1px solid var(--border); border-radius: 12px; background: #17151d; }
+.editor-heading, .translation-controls { display: flex; align-items: center; gap: 8px; }
+.editor-heading { justify-content: space-between; margin-bottom: 10px; }
+.editor-heading h3 { margin: 0; font-size: 15px; }
+.editor-heading p { margin: 3px 0 0; font-size: 12px; }
+.translation-editor-list { display: grid; gap: 10px; }
+.translation-entry { display: grid; grid-template-columns: minmax(130px, .7fr) minmax(190px, 1.3fr); gap: 8px 12px; padding: 10px 0; border-top: 1px solid #2b2732; }
+.translation-source p { margin: 4px 0; white-space: pre-wrap; }
+.translation-source .muted { font-size: 11px; }
+.translation-entry textarea { min-height: 52px; resize: vertical; }
+.translation-controls { grid-column: 2; justify-content: flex-end; }
+.translation-controls select, .translation-controls input { width: auto; padding: 7px 8px; }
+.translation-controls input { max-width: 76px; }
+.translation-controls .muted { font-size: 12px; }
 .reader-stage { flex: 1; min-height: 0; overflow: auto; padding: 0 4px 25px; background: #0c0b10; border-radius: 12px; }
 .reader-page { width: min(100%, 760px); margin: 0 auto 18px; }
 .reader-canvas { position: relative; }
@@ -79,4 +93,4 @@ dialog::backdrop { background: #08070cb8; backdrop-filter: blur(3px); }
 .lettering-layer { position: absolute; display: flex; align-items: center; justify-content: center; overflow: hidden; padding: 5px 7px; line-height: 1.15; white-space: pre-wrap; overflow-wrap: anywhere; }
 .reader-page figcaption { padding: 7px; color: var(--muted); text-align: center; font-size: 12px; }
 .reader-empty { display: grid; height: 100%; min-height: 220px; place-items: center; color: var(--muted); }
-@media (max-width: 620px) { .shell { padding-inline: 16px; } .hero { min-height: 300px; padding: 28px; } .toolbar { align-items: stretch; flex-direction: column; } .toolbar input { max-width: none; } }
+@media (max-width: 620px) { .shell { padding-inline: 16px; } .hero { min-height: 300px; padding: 28px; } .toolbar { align-items: stretch; flex-direction: column; } .toolbar input { max-width: none; } .translation-entry { grid-template-columns: 1fr; } .translation-controls { grid-column: 1; justify-content: flex-start; } }

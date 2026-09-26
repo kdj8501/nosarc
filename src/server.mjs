@@ -580,7 +580,7 @@ function listChapters(seriesId) {
 }
 
 function getChapter(id) {
-  const chapter = db.prepare(`SELECT c.*, s.title AS series_title, a.original_name AS source_name FROM chapters c
+  const chapter = db.prepare(`SELECT c.*, s.title AS series_title, s.target_language, a.original_name AS source_name FROM chapters c
     JOIN series s ON s.id = c.series_id JOIN assets a ON a.id = c.source_asset_id WHERE c.id = ?`).get(id);
   if (!chapter) return null;
   const pages = db.prepare(`SELECT p.*, a.mime_type, a.original_name, a.id AS asset_id FROM pages p JOIN assets a ON a.id = p.image_asset_id
