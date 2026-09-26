@@ -17,6 +17,7 @@ async function boot() {
   $('#reader-original').addEventListener('click', () => setReaderMode('original'));
   $('#reader-translated').addEventListener('click', () => setReaderMode('translated'));
   $('#reader-editor-toggle').addEventListener('click', toggleTranslationEditor);
+  $('#reader-render').addEventListener('click', renderReaderImages);
   $('#search').addEventListener('input', () => loadSeries($('#search').value));
 }
 
@@ -148,10 +149,13 @@ function renderReader() {
   $('#reader-translated').disabled = !hasTranslation;
   const hasBlocks = chapter.pages.some((page) => page.ocr_blocks?.length);
   $('#reader-editor-toggle').disabled = !hasBlocks;
-  $('#reader-notice').textContent = chapter.pages.length ? activeMode === 'translated' ? '번역문과 식자 레이어를 표시하고 있습니다.' : '원본 페이지를 표시하고 있습니다.' : '아직 변환된 페이지가 없습니다.';
+  $('#reader-render').disabled = !hasTranslation;
+  $('#reader-notice').textContent = chapter.pages.length ? activeMode === 'translated' ? '원문을 제거하고 번역문을 이미지에 렌더링했습니다.' : '원본 페이지를 표시하고 있습니다.' : '아직 변환된 페이지가 없습니다.';
   $('#reader-stage').innerHTML = chapter.pages.length ? chapter.pages.map((page) => {
-    const layers = activeMode === 'translated' ? (page.lettering_layers || []).map(renderLetteringLayer).join('') : '';
-    return `<figure class="reader-page"><div class="reader-canvas"><img src="${page.media_url}" alt="${escapeHtml(chapter.number_label)} 페이지 ${page.page_index + 1}" loading="lazy" />${layers}</div><figcaption>${page.page_index + 1} / ${chapter.pages.length}</figcaption></figure>`;
+    const rendered = activeMode === 'translated' && page.translated_media_url;
+    const layers = activeMode === 'translated' && !rendered ? (page.lettering_layers || []).map(renderLetteringLayer).join('') : '';
+    const mediaUrl = rendered ? page.translated_media_url : page.media_url;
+    return `<figure class="reader-page"><div class="reader-canvas"><img src="${mediaUrl}" alt="${escapeHtml(chapter.number_label)} 페이지 ${page.page_index + 1}" loading="lazy" />${layers}</div><figcaption>${page.page_index + 1} / ${chapter.pages.length}</figcaption></figure>`;
   }).join('') : '<div class="reader-empty"><p>페이지가 준비되면 이곳에서 읽을 수 있습니다.</p></div>';
   renderTranslationEditor();
 }
@@ -211,6 +215,30 @@ async function saveTranslation(blockId) {
   showNotice('번역과 식자 레이어를 저장했습니다.');
 }
 
+async function renderReaderImages() {
+  if (!state.reader) return;
+  const result = await request(`/api/chapters/${state.reader.chapter.id}/render`, { method: 'POST' });
+  if (!result?.id) return;
+  showNotice('원문 제거와 이미지 렌더링을 시작했습니다.');
+  watchReaderRender(result.id);
+}
+
+async function watchReaderRender(jobId) {
+  const job = await request(`/api/jobs/${jobId}`);
+  if (!job || !state.reader) return;
+  if (['completed', 'failed', 'cancelled'].includes(job.status)) {
+    if (job.status === 'completed') {
+      state.reader.chapter = await request(`/api/chapters/${state.reader.chapter.id}`);
+      renderReader();
+      showNotice('번역 이미지 렌더링이 완료되었습니다.');
+    } else if (job.status === 'failed') {
+      showNotice(`이미지 렌더링 실패: ${job.error_message || '원인을 확인해 주세요.'}`, true);
+    }
+    return;
+  }
+  setTimeout(() => watchReaderRender(jobId), 1000);
+}
+
 async function createSeries(event) {
   event.preventDefault();
   const result = await request('/api/series', { method: 'POST', body: { title: $('#series-title').value, originalTitle: $('#series-original-title').value, description: $('#series-description').value, tags: $('#series-tags').value.split(',') } });
@@ -244,7 +272,7 @@ async function watchJob(jobId) {
   const job = await request(`/api/jobs/${jobId}`);
   if (!job) return;
   if (['completed', 'failed', 'cancelled'].includes(job.status)) {
-    const jobLabel = job.type === 'ocr' ? 'OCR' : job.type === 'auto_translate' ? '자동 역식' : '페이지 변환';
+    const jobLabel = job.type === 'ocr' ? 'OCR' : job.type === 'auto_translate' ? '자동 역식' : job.type === 'render' ? '이미지 렌더링' : '페이지 변환';
     const message = job.status === 'completed' ? `${jobLabel}이 완료되었습니다.` : job.status === 'failed' ? `${jobLabel} 실패: ${job.error_message || '원인을 확인해 주세요.'}` : `${jobLabel}이 취소되었습니다.`;
     showNotice(message, job.status !== 'completed');
     await loadSeries($('#search').value);

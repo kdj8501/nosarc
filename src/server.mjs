@@ -21,6 +21,7 @@ import {
   verifySessionToken,
 } from './security.mjs';
 import { createOcrWorker, extractOcrBlocks, recognizePage } from './ocr.mjs';
+import { renderTranslatedPage } from './render.mjs';
 
 globalThis.DOMMatrix = canvas.DOMMatrix;
 globalThis.ImageData = canvas.ImageData;
@@ -57,6 +58,8 @@ const config = {
   ocrMangaModel: process.env.OCR_MANGA_MODEL || 'kha-white/manga-ocr-base',
   ocrMangaCachePath: resolveFromRoot(process.env.OCR_MANGA_CACHE_PATH || './data/models/huggingface'),
   ocrMangaPadding: Number(process.env.OCR_MANGA_PADDING || 0.04),
+  inpaintPadding: Number(process.env.INPAINT_PADDING || 0.008),
+  letteringFontPath: process.env.LETTERING_FONT_PATH || (process.platform === 'win32' ? 'C:\\Windows\\Fonts\\malgun.ttf' : ''),
   aiTranslationProvider: process.env.AI_TRANSLATION_PROVIDER || 'ctranslate2',
   aiWorkerCommand: process.env.AI_WORKER_COMMAND || 'python',
   aiWorkerScript: resolveFromRoot(process.env.AI_WORKER_SCRIPT || './ai-worker/worker.py'),
@@ -134,6 +137,7 @@ db.exec(`
     image_asset_id TEXT NOT NULL REFERENCES assets(id),
     width INTEGER,
     height INTEGER,
+    rendered_asset_id TEXT REFERENCES assets(id),
     UNIQUE(chapter_id, page_index)
   );
   CREATE TABLE IF NOT EXISTS ocr_blocks (
@@ -187,6 +191,11 @@ db.exec(`
   );
 `);
 
+const pageColumns = db.prepare('PRAGMA table_info(pages)').all();
+if (!pageColumns.some((column) => column.name === 'rendered_asset_id')) {
+  db.exec('ALTER TABLE pages ADD COLUMN rendered_asset_id TEXT REFERENCES assets(id)');
+}
+
 const sessions = new Map();
 const ingestQueue = [];
 let ingestActive = false;
@@ -194,6 +203,8 @@ const ocrQueue = [];
 let ocrActive = false;
 const autoTranslationQueue = [];
 let autoTranslationActive = false;
+const renderQueue = [];
+let renderActive = false;
 const activeAiProcesses = new Map();
 const app = express();
 app.disable('x-powered-by');
@@ -397,13 +408,27 @@ app.post('/api/chapters/:id/auto-translate', (req, res) => {
   if (chapter.page_count < 1 || chapter.processing_status !== 'completed') return res.status(409).json({ error: '페이지 변환이 완료된 권에서만 자동 번역을 실행할 수 있습니다.' });
   const blockCount = db.prepare(`SELECT COUNT(*) AS count FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ?`).get(chapter.id).count;
   if (!blockCount) return res.status(409).json({ error: '먼저 OCR을 실행해 번역할 텍스트를 만들어 주세요.' });
-  const activeJob = db.prepare(`SELECT * FROM jobs WHERE chapter_id = ? AND type = 'auto_translate' AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`).get(chapter.id);
+  const activeJob = db.prepare(`SELECT * FROM jobs WHERE chapter_id = ? AND type IN ('auto_translate', 'render') AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`).get(chapter.id);
   if (activeJob) return res.status(409).json({ error: '이미 자동 번역 작업이 진행 중입니다.', job_id: activeJob.id });
   const jobId = crypto.randomUUID();
   const now = new Date().toISOString();
   db.prepare(`INSERT INTO jobs (id, chapter_id, type, status, current_stage, progress, created_at) VALUES (?, ?, 'auto_translate', 'queued', 'translation', 0, ?)`).run(jobId, chapter.id, now);
   enqueueAutoTranslation(jobId);
   res.status(202).json({ id: jobId, type: 'auto_translate', status: 'queued' });
+});
+
+app.post('/api/chapters/:id/render', (req, res) => {
+  const chapter = db.prepare('SELECT * FROM chapters WHERE id = ?').get(req.params.id);
+  if (!chapter) return res.status(404).json({ error: '권을 찾을 수 없습니다.' });
+  const layerCount = db.prepare(`SELECT COUNT(*) AS count FROM lettering_layers l JOIN pages p ON p.id = l.page_id WHERE p.chapter_id = ? AND l.is_active = 1`).get(chapter.id).count;
+  if (!layerCount) return res.status(409).json({ error: '먼저 번역문을 저장해 주세요.' });
+  const activeJob = db.prepare(`SELECT * FROM jobs WHERE chapter_id = ? AND type IN ('auto_translate', 'render') AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`).get(chapter.id);
+  if (activeJob) return res.status(409).json({ error: '이미 이미지 렌더링 작업이 진행 중입니다.', job_id: activeJob.id });
+  const jobId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO jobs (id, chapter_id, type, status, current_stage, progress, created_at) VALUES (?, ?, 'render', 'queued', 'rendering', 0, ?)`).run(jobId, chapter.id, now);
+  enqueueRender(jobId);
+  res.status(202).json({ id: jobId, type: 'render', status: 'queued' });
 });
 
 app.post('/api/pages/:id/ocr-blocks', (req, res) => {
@@ -436,7 +461,7 @@ app.post('/api/pages/:id/ocr-blocks', (req, res) => {
   res.status(201).json(getOcrBlock(id));
 });
 
-app.patch('/api/ocr-blocks/:id', (req, res) => {
+app.patch('/api/ocr-blocks/:id', async (req, res) => {
   const current = getOcrBlock(req.params.id);
   if (!current) return res.status(404).json({ error: 'OCR 블록을 찾을 수 없습니다.' });
   let polygon = current.polygon;
@@ -459,10 +484,11 @@ app.patch('/api/ocr-blocks/:id', (req, res) => {
     req.params.id,
   );
   db.prepare(`UPDATE lettering_layers SET polygon_json = ?, updated_at = ? WHERE translation_id IN (SELECT id FROM translations WHERE ocr_block_id = ? AND is_active = 1)`).run(JSON.stringify(polygon), now, req.params.id);
+  await clearRenderedPage(current.page_id);
   res.json(getOcrBlock(req.params.id));
 });
 
-app.post('/api/ocr-blocks/:id/translations', (req, res) => {
+app.post('/api/ocr-blocks/:id/translations', async (req, res) => {
   const block = db.prepare(`SELECT b.*, s.target_language AS series_target_language FROM ocr_blocks b
     JOIN pages p ON p.id = b.page_id JOIN chapters c ON c.id = p.chapter_id JOIN series s ON s.id = c.series_id
     WHERE b.id = ?`).get(req.params.id);
@@ -494,10 +520,11 @@ app.post('/api/ocr-blocks/:id/translations', (req, res) => {
       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(layerId, block.page_id, translationId, block.polygon_json, translatedText, JSON.stringify(style), now, now);
   });
   create();
+  await clearRenderedPage(block.page_id);
   res.status(201).json(getTranslation(translationId));
 });
 
-app.patch('/api/lettering-layers/:id', (req, res) => {
+app.patch('/api/lettering-layers/:id', async (req, res) => {
   const current = getLetteringLayer(req.params.id);
   if (!current) return res.status(404).json({ error: '식자 레이어를 찾을 수 없습니다.' });
   let polygon = current.polygon;
@@ -519,6 +546,7 @@ app.patch('/api/lettering-layers/:id', (req, res) => {
     new Date().toISOString(),
     req.params.id,
   );
+  await clearRenderedPage(current.page_id);
   res.json(getLetteringLayer(req.params.id));
 });
 
@@ -534,11 +562,12 @@ app.post('/api/jobs/:id/retry', (req, res) => {
   if (!['failed', 'cancelled'].includes(job.status)) return res.status(409).json({ error: '실패하거나 취소된 작업만 재시도할 수 있습니다.' });
   const now = new Date().toISOString();
   db.transaction(() => {
-    db.prepare(`UPDATE jobs SET status = 'queued', current_stage = ?, progress = 0, error_message = NULL, started_at = NULL, finished_at = NULL WHERE id = ?`).run(job.type === 'ocr' ? 'ocr' : job.type === 'auto_translate' ? 'translation' : 'preparing', job.id);
+    db.prepare(`UPDATE jobs SET status = 'queued', current_stage = ?, progress = 0, error_message = NULL, started_at = NULL, finished_at = NULL WHERE id = ?`).run(job.type === 'ocr' ? 'ocr' : job.type === 'auto_translate' ? 'translation' : job.type === 'render' ? 'rendering' : 'preparing', job.id);
     if (job.type === 'ingest') db.prepare(`UPDATE chapters SET processing_status = 'queued', updated_at = ? WHERE id = ?`).run(now, job.chapter_id);
   })();
   if (job.type === 'ocr') enqueueOcr(job.id);
   else if (job.type === 'auto_translate') enqueueAutoTranslation(job.id);
+  else if (job.type === 'render') enqueueRender(job.id);
   else enqueueIngest(job.id);
   res.status(202).json({ id: job.id, status: 'queued' });
 });
@@ -622,7 +651,8 @@ function getChapter(id) {
   const chapter = db.prepare(`SELECT c.*, s.title AS series_title, s.target_language, a.original_name AS source_name FROM chapters c
     JOIN series s ON s.id = c.series_id JOIN assets a ON a.id = c.source_asset_id WHERE c.id = ?`).get(id);
   if (!chapter) return null;
-  const pages = db.prepare(`SELECT p.*, a.mime_type, a.original_name, a.id AS asset_id FROM pages p JOIN assets a ON a.id = p.image_asset_id
+  const pages = db.prepare(`SELECT p.*, a.mime_type, a.original_name, a.id AS asset_id, ra.id AS translated_asset_id, ra.mime_type AS translated_mime_type FROM pages p JOIN assets a ON a.id = p.image_asset_id
+    LEFT JOIN assets ra ON ra.id = p.rendered_asset_id
     WHERE p.chapter_id = ? ORDER BY p.page_index`).all(id);
   const blocks = db.prepare(`SELECT b.* FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ? ORDER BY b.reading_order, b.created_at`).all(id).map(serializeOcrBlock);
   const translations = db.prepare(`SELECT t.* FROM translations t JOIN ocr_blocks b ON b.id = t.ocr_block_id JOIN pages p ON p.id = b.page_id
@@ -634,6 +664,7 @@ function getChapter(id) {
   chapter.pages = pages.map((page) => ({
     ...page,
     media_url: `/media/${page.asset_id}`,
+    translated_media_url: page.translated_asset_id ? `/media/${page.translated_asset_id}` : null,
     ocr_blocks: (blocksByPage[page.id] || []).map((block) => ({ ...block, translation: translationsByBlock[block.id]?.[0] || null })),
     lettering_layers: layersByPage[page.id] || [],
   }));
@@ -756,6 +787,7 @@ function insertOcrBlocks(page, blocks, recognized, modelId, modelVersion) {
 }
 
 async function clearOcrResults(chapterId) {
+  await clearRenderedPages(chapterId);
   db.transaction(() => {
     db.prepare(`DELETE FROM lettering_layers WHERE translation_id IN (
       SELECT t.id FROM translations t JOIN ocr_blocks b ON b.id = t.ocr_block_id JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ?
@@ -785,6 +817,111 @@ async function drainAutoTranslationQueue() {
   }
 }
 
+function enqueueRender(jobId) {
+  if (!renderQueue.includes(jobId)) renderQueue.push(jobId);
+  void drainRenderQueue();
+}
+
+async function drainRenderQueue() {
+  if (renderActive) return;
+  renderActive = true;
+  try {
+    while (renderQueue.length) await runRenderJob(renderQueue.shift());
+  } finally {
+    renderActive = false;
+  }
+}
+
+async function runRenderJob(jobId) {
+  const job = db.prepare(`SELECT * FROM jobs WHERE id = ? AND type = 'render'`).get(jobId);
+  if (!job || job.status === 'cancelled') return;
+  db.prepare(`UPDATE jobs SET status = 'running', current_stage = 'rendering', progress = 1, started_at = ?, error_message = NULL WHERE id = ?`)
+    .run(new Date().toISOString(), jobId);
+  try {
+    const rendered = await renderChapterImages(job.chapter_id, jobId, (progress) => {
+      db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(99, Math.max(1, Math.round(progress))), jobId);
+    });
+    if (!rendered || isJobCancelled(jobId)) return;
+    db.prepare(`UPDATE jobs SET status = 'completed', current_stage = 'completed', progress = 100, finished_at = ?, error_message = NULL WHERE id = ?`)
+      .run(new Date().toISOString(), jobId);
+  } catch (error) {
+    if (!isJobCancelled(jobId)) {
+      db.prepare(`UPDATE jobs SET status = 'failed', current_stage = 'failed', error_message = ?, finished_at = ? WHERE id = ?`)
+        .run(String(error.message || '이미지 렌더링에 실패했습니다.').slice(0, 500), new Date().toISOString(), jobId);
+    }
+  }
+}
+
+async function renderChapterImages(chapterId, jobId = null, onProgress = () => {}) {
+  const pages = db.prepare(`SELECT p.*, a.storage_key, a.original_name, a.mime_type
+    FROM pages p JOIN assets a ON a.id = p.image_asset_id WHERE p.chapter_id = ? ORDER BY p.page_index`).all(chapterId);
+  const layers = db.prepare(`SELECT l.* FROM lettering_layers l JOIN pages p ON p.id = l.page_id
+    WHERE p.chapter_id = ? AND l.is_active = 1 AND TRIM(l.text) <> '' ORDER BY l.created_at`).all(chapterId);
+  const layersByPage = groupBy(layers, 'page_id');
+  for (const [index, page] of pages.entries()) {
+    if (jobId && isJobCancelled(jobId)) return false;
+    const pageLayers = layersByPage[page.id] || [];
+    if (pageLayers.length) {
+      const buffer = await renderTranslatedPage(assetPath(page), pageLayers, { inpaintPadding: config.inpaintPadding, fontPath: config.letteringFontPath });
+      await saveRenderedPage(page, buffer);
+    } else {
+      await clearRenderedPage(page.id);
+    }
+    onProgress(((index + 1) / Math.max(1, pages.length)) * 100);
+  }
+  return true;
+}
+
+async function saveRenderedPage(page, buffer) {
+  const assetId = crypto.randomUUID();
+  const storageKey = `${assetId}.png`;
+  const destination = path.join(config.mediaRoot, storageKey);
+  await fsp.writeFile(destination, buffer, { flag: 'wx' });
+  let previousAsset = null;
+  try {
+    const now = new Date().toISOString();
+    previousAsset = db.prepare(`SELECT a.* FROM pages p LEFT JOIN assets a ON a.id = p.rendered_asset_id WHERE p.id = ?`).get(page.id);
+    db.transaction(() => {
+      db.prepare(`INSERT INTO assets (id, storage_key, original_name, mime_type, byte_size, sha256, kind, created_at)
+        VALUES (?, ?, ?, 'image/png', ?, ?, 'page', ?)`).run(
+        assetId,
+        storageKey,
+        `translated-${Number(page.page_index) + 1}.png`,
+        buffer.length,
+        crypto.createHash('sha256').update(buffer).digest('hex'),
+        now,
+      );
+      db.prepare('UPDATE pages SET rendered_asset_id = ? WHERE id = ?').run(assetId, page.id);
+      if (previousAsset?.id) db.prepare('DELETE FROM assets WHERE id = ?').run(previousAsset.id);
+    })();
+  } catch (error) {
+    await fsp.unlink(destination).catch(() => undefined);
+    throw error;
+  }
+  if (previousAsset?.storage_key) await fsp.unlink(path.join(config.mediaRoot, previousAsset.storage_key)).catch(() => undefined);
+}
+
+async function clearRenderedPage(pageId) {
+  const previousAsset = db.prepare(`SELECT a.* FROM pages p LEFT JOIN assets a ON a.id = p.rendered_asset_id WHERE p.id = ?`).get(pageId);
+  if (!previousAsset?.id) return;
+  db.transaction(() => {
+    db.prepare('UPDATE pages SET rendered_asset_id = NULL WHERE id = ?').run(pageId);
+    db.prepare('DELETE FROM assets WHERE id = ?').run(previousAsset.id);
+  })();
+  await fsp.unlink(path.join(config.mediaRoot, previousAsset.storage_key)).catch(() => undefined);
+}
+
+async function clearRenderedPages(chapterId) {
+  const previousAssets = db.prepare(`SELECT a.* FROM pages p JOIN assets a ON a.id = p.rendered_asset_id WHERE p.chapter_id = ?`).all(chapterId);
+  if (!previousAssets.length) return;
+  db.transaction(() => {
+    db.prepare('UPDATE pages SET rendered_asset_id = NULL WHERE chapter_id = ?').run(chapterId);
+    const deleteAsset = db.prepare('DELETE FROM assets WHERE id = ?');
+    for (const asset of previousAssets) deleteAsset.run(asset.id);
+  })();
+  await Promise.all(previousAssets.map((asset) => fsp.unlink(path.join(config.mediaRoot, asset.storage_key)).catch(() => undefined)));
+}
+
 async function runAutoTranslationJob(jobId) {
   const job = db.prepare(`SELECT * FROM jobs WHERE id = ? AND type = 'auto_translate'`).get(jobId);
   if (!job || job.status === 'cancelled') return;
@@ -795,6 +932,7 @@ async function runAutoTranslationJob(jobId) {
   db.prepare(`UPDATE jobs SET status = 'running', current_stage = 'translation', progress = 1, started_at = ?, error_message = NULL WHERE id = ?`)
     .run(new Date().toISOString(), jobId);
   try {
+    await clearRenderedPages(chapter.id);
     const results = await runTranslationWorker(jobId, {
       sourceLanguage: 'ja',
       targetLanguage: chapter.target_language || 'ko',
@@ -842,6 +980,12 @@ async function runAutoTranslationJob(jobId) {
       }
     });
     saveTranslations();
+    if (isJobCancelled(jobId)) return;
+    db.prepare('UPDATE jobs SET current_stage = ?, progress = ? WHERE id = ?').run('rendering', 92, jobId);
+    const rendered = await renderChapterImages(chapter.id, jobId, (progress) => {
+      db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(99, 92 + Math.round(progress * 0.07)), jobId);
+    });
+    if (!rendered || isJobCancelled(jobId)) return;
     const finishedAt = new Date().toISOString();
     db.prepare(`UPDATE jobs SET status = 'completed', current_stage = 'completed', progress = 100, finished_at = ?, error_message = NULL WHERE id = ?`).run(finishedAt, jobId);
   } catch (error) {
