@@ -18,15 +18,20 @@
 
       <section class="hero">
         <div>
-          <p class="eyebrow">YOUR LIBRARY</p>
-          <h2>작품을 정리하고<br />읽을 준비를 하세요.</h2>
-          <p class="muted">원본 파일은 로컬에 보관되고, 이후 OCR과 번역 작업이 작품별로 이어집니다.</p>
+          <p class="eyebrow">YOUR MANGA LIBRARY</p>
+          <h2>올리고,<br />바로 읽으세요.</h2>
+          <p class="muted">파일을 올리면 페이지 정리부터 OCR, 자동 번역·식자까지 백그라운드에서 이어집니다. 완료되면 번역된 만화 뷰어가 열립니다.</p>
         </div>
+        <div class="hero-flow" aria-label="자동 처리 순서"><span>업로드</span><i>→</i><span>OCR</span><i>→</i><span>번역·식자</span><i>→</i><span>읽기</span></div>
       </section>
 
       <section class="toolbar">
         <input id="search" type="search" placeholder="작품 검색" />
         <button id="new-series" class="button primary">+ 작품 추가</button>
+      </section>
+      <section id="activity-panel" class="activity-panel" hidden>
+        <div class="section-heading"><div><p class="eyebrow">IN PROGRESS</p><h2>처리 중인 만화</h2></div><span class="muted">페이지를 닫아도 계속 진행됩니다.</span></div>
+        <div id="activity-list" class="activity-list"></div>
       </section>
       <p id="notice" class="notice" role="status"></p>
       <section id="series-list" class="series-grid"></section>
@@ -72,14 +77,26 @@
         <input id="chapter-title" />
         <label for="chapter-files">페이지 이미지</label>
         <input id="chapter-files" type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/tiff,application/pdf,application/zip,.cbz" multiple required />
-        <p class="hint">이미지는 선택한 순서대로 저장됩니다. PDF/CBZ는 원본을 먼저 보관합니다.</p>
-        <div class="dialog-actions"><button class="button ghost" value="cancel">취소</button><button class="button primary" value="default">업로드</button></div>
+        <div class="upload-promise"><strong>업로드 후 자동으로 처리합니다</strong><span>페이지 준비 → OCR 읽기 → 자동 번역·식자 → 만화 뷰어</span></div>
+        <p class="hint">이미지는 선택한 순서대로 저장됩니다. PDF/CBZ도 원본을 보관한 뒤 자동으로 페이지를 준비합니다.</p>
+        <div class="dialog-actions"><button class="button ghost" value="cancel">취소</button><button class="button primary" value="default">업로드하고 처리 시작</button></div>
       </form>
+    </dialog>
+
+    <dialog id="processing-dialog" class="processing-dialog">
+      <div class="processing-card">
+        <div class="dialog-header"><div><p class="eyebrow">PROCESSING</p><h2 id="processing-title">만화를 준비하고 있습니다</h2></div><button id="processing-close" class="icon-button" type="button" aria-label="닫기">×</button></div>
+        <div id="processing-pipeline" class="processing-pipeline" aria-label="처리 단계"></div>
+        <div class="progress-row"><progress id="processing-progress" max="100" value="0"></progress><strong id="processing-percent">0%</strong></div>
+        <p id="processing-stage" class="processing-stage">작업을 준비하고 있습니다.</p>
+        <p id="processing-error" class="error"></p>
+        <div class="dialog-actions"><button id="processing-cancel" class="button ghost" type="button">처리 취소</button><button id="processing-read" class="button primary" type="button" hidden>읽기</button></div>
+      </div>
     </dialog>
 
     <dialog id="series-detail-dialog" class="detail-dialog">
       <div class="detail-card">
-        <div class="dialog-header"><div><p class="eyebrow">SERIES</p><h2 id="series-detail-title"></h2></div><button id="series-detail-close" class="icon-button" type="button" aria-label="닫기">×</button></div>
+        <div class="dialog-header"><div><p class="eyebrow">SERIES</p><h2 id="series-detail-title"></h2></div><div class="dialog-header-actions"><button id="series-delete" class="button small danger" type="button">작품 삭제</button><button id="series-detail-close" class="icon-button" type="button" aria-label="닫기">×</button></div></div>
         <p id="series-detail-description" class="muted"></p>
         <div id="series-detail-tags"></div>
         <div class="section-heading"><h3>권 목록</h3><span id="series-detail-count" class="muted"></span></div>

@@ -212,6 +212,7 @@ let autoTranslationActive = false;
 const renderQueue = [];
 let renderActive = false;
 const activeAiProcesses = new Map();
+const activeOcrWorkers = new Map();
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '2mb' }));
@@ -293,6 +294,12 @@ app.get('/api/series', (req, res) => {
   res.json(db.prepare(query).all(search, search, search));
 });
 
+app.get('/api/jobs/active', (_req, res) => {
+  res.json(db.prepare(`SELECT j.*, c.number_label, c.series_id, s.title AS series_title
+    FROM jobs j JOIN chapters c ON c.id = j.chapter_id JOIN series s ON s.id = c.series_id
+    WHERE j.status IN ('queued', 'running') ORDER BY j.created_at ASC`).all());
+});
+
 app.post('/api/series', (req, res) => {
   const title = String(req.body?.title || '').trim();
   if (!title || title.length > 200) return res.status(400).json({ error: '작품명은 1~200자로 입력해 주세요.' });
@@ -331,6 +338,23 @@ app.patch('/api/series/:id', (req, res) => {
     .run(title, cleanOptional(req.body?.originalTitle ?? current.original_title), cleanOptional(req.body?.description ?? current.description), cleanOptional(req.body?.targetLanguage ?? current.target_language) || 'ko', req.body?.status === 'archived' ? 'archived' : current.status, new Date().toISOString(), req.params.id);
   if (Array.isArray(req.body?.tags)) attachTags(req.params.id, req.body.tags);
   res.json(getSeries(req.params.id));
+});
+
+app.delete('/api/series/:id', async (req, res, next) => {
+  try {
+    const series = getSeries(req.params.id);
+    if (!series) return res.status(404).json({ error: '작품을 찾을 수 없습니다.' });
+    const assets = collectSeriesAssets(series.id);
+    cancelJobsForChapters(listChapterIds(series.id));
+    db.transaction(() => {
+      db.prepare('DELETE FROM series WHERE id = ?').run(series.id);
+      for (const asset of assets) db.prepare('DELETE FROM assets WHERE id = ?').run(asset.id);
+    })();
+    await removeAssetFiles(assets);
+    res.json({ id: series.id, deleted: true });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post('/api/series/:id/chapters', upload.array('files', config.maxPages), async (req, res, next) => {
@@ -381,6 +405,7 @@ app.post('/api/series/:id/chapters', upload.array('files', config.maxPages), asy
     }
     db.prepare('UPDATE series SET updated_at = ? WHERE id = ?').run(new Date().toISOString(), series.id);
     if (jobId) enqueueIngest(jobId);
+    else jobId = queueOcrJob(chapterId);
     res.status(202).json({ id: chapterId, status, job_id: jobId, chapter: getChapter(chapterId) });
   } catch (error) {
     next(error);
@@ -391,6 +416,23 @@ app.get('/api/chapters/:id', (req, res) => {
   const chapter = getChapter(req.params.id);
   if (!chapter) return res.status(404).json({ error: '권을 찾을 수 없습니다.' });
   res.json(chapter);
+});
+
+app.delete('/api/chapters/:id', async (req, res, next) => {
+  try {
+    const chapter = db.prepare('SELECT * FROM chapters WHERE id = ?').get(req.params.id);
+    if (!chapter) return res.status(404).json({ error: '권을 찾을 수 없습니다.' });
+    const assets = collectChapterAssets(chapter.id);
+    cancelJobsForChapters([chapter.id]);
+    db.transaction(() => {
+      db.prepare('DELETE FROM chapters WHERE id = ?').run(chapter.id);
+      for (const asset of assets) db.prepare('DELETE FROM assets WHERE id = ?').run(asset.id);
+    })();
+    await removeAssetFiles(assets);
+    res.json({ id: chapter.id, deleted: true });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post('/api/chapters/:id/ocr', (req, res) => {
@@ -587,6 +629,7 @@ app.post('/api/jobs/:id/cancel', (req, res) => {
     db.prepare(`UPDATE jobs SET status = 'cancelled', current_stage = 'cancelled', finished_at = ? WHERE id = ?`).run(now, job.id);
     if (job.type === 'ingest') db.prepare(`UPDATE chapters SET processing_status = 'cancelled', updated_at = ? WHERE id = ?`).run(now, job.chapter_id);
   })();
+  if (job.type === 'ocr') void activeOcrWorkers.get(job.id)?.terminate().catch(() => undefined);
   if (job.type === 'auto_translate') activeAiProcesses.get(job.id)?.kill();
   if (job.type === 'render') activeAiProcesses.get(job.id)?.kill();
   res.json({ id: job.id, status: 'cancelled' });
@@ -615,6 +658,7 @@ app.use((error, _req, res, _next) => {
 
 const server = app.listen(config.port, () => {
   console.log(`${config.appName} listening on http://localhost:${config.port}`);
+  recoverJobs();
 });
 
 function requireSession(req, res, next) {
@@ -642,16 +686,74 @@ function getSeries(id) {
   return row || null;
 }
 
+function listChapterIds(seriesId) {
+  return db.prepare('SELECT id FROM chapters WHERE series_id = ?').all(seriesId).map((chapter) => chapter.id);
+}
+
+function collectChapterAssets(chapterId) {
+  return db.prepare(`SELECT DISTINCT a.* FROM assets a WHERE a.id IN (
+    SELECT source_asset_id FROM chapters WHERE id = ?
+    UNION SELECT image_asset_id FROM pages WHERE chapter_id = ?
+    UNION SELECT rendered_asset_id FROM pages WHERE chapter_id = ?
+  )`).all(chapterId, chapterId, chapterId);
+}
+
+function collectSeriesAssets(seriesId) {
+  return db.prepare(`SELECT DISTINCT a.* FROM assets a WHERE a.id IN (
+    SELECT source_asset_id FROM chapters WHERE series_id = ?
+    UNION SELECT p.image_asset_id FROM pages p JOIN chapters c ON c.id = p.chapter_id WHERE c.series_id = ?
+    UNION SELECT p.rendered_asset_id FROM pages p JOIN chapters c ON c.id = p.chapter_id WHERE c.series_id = ?
+  )`).all(seriesId, seriesId, seriesId);
+}
+
+function cancelJobsForChapters(chapterIds) {
+  if (!chapterIds.length) return;
+  const placeholders = chapterIds.map(() => '?').join(', ');
+  const jobs = db.prepare(`SELECT * FROM jobs WHERE chapter_id IN (${placeholders}) AND status IN ('queued', 'running')`).all(...chapterIds);
+  const now = new Date().toISOString();
+  for (const job of jobs) {
+    db.prepare(`UPDATE jobs SET status = 'cancelled', current_stage = 'cancelled', finished_at = ? WHERE id = ?`).run(now, job.id);
+    removeQueuedJob(ingestQueue, job.id);
+    removeQueuedJob(ocrQueue, job.id);
+    removeQueuedJob(autoTranslationQueue, job.id);
+    removeQueuedJob(renderQueue, job.id);
+    activeAiProcesses.get(job.id)?.kill();
+    void activeOcrWorkers.get(job.id)?.terminate().catch(() => undefined);
+  }
+}
+
+function removeQueuedJob(queue, jobId) {
+  let index = queue.indexOf(jobId);
+  while (index !== -1) {
+    queue.splice(index, 1);
+    index = queue.indexOf(jobId);
+  }
+}
+
+async function removeAssetFiles(assets) {
+  await Promise.all(assets.map((asset) => fsp.unlink(assetPath(asset)).catch(() => undefined)));
+}
+
 function listChapters(seriesId) {
   return db.prepare(`SELECT c.*, a.original_name AS source_name FROM chapters c JOIN assets a ON a.id = c.source_asset_id
-    WHERE c.series_id = ? ORDER BY c.sort_key ASC, c.created_at ASC`).all(seriesId).map((chapter) => ({
-    ...chapter,
-    ocr_block_count: db.prepare('SELECT COUNT(*) AS count FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ?').get(chapter.id).count,
-    translation_count: db.prepare('SELECT COUNT(*) AS count FROM translations t JOIN ocr_blocks b ON b.id = t.ocr_block_id JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ? AND t.is_active = 1').get(chapter.id).count,
-    job_id: db.prepare('SELECT id FROM jobs WHERE chapter_id = ? ORDER BY created_at DESC LIMIT 1').get(chapter.id)?.id || null,
-    job_type: db.prepare('SELECT type FROM jobs WHERE chapter_id = ? ORDER BY created_at DESC LIMIT 1').get(chapter.id)?.type || null,
-    job_status: db.prepare('SELECT status FROM jobs WHERE chapter_id = ? ORDER BY created_at DESC LIMIT 1').get(chapter.id)?.status || null,
-  }));
+    WHERE c.series_id = ? ORDER BY c.sort_key ASC, c.created_at ASC`).all(seriesId).map((chapter) => {
+    const job = latestJob(chapter.id);
+    return {
+      ...chapter,
+      ocr_block_count: db.prepare('SELECT COUNT(*) AS count FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ?').get(chapter.id).count,
+      translation_count: db.prepare('SELECT COUNT(*) AS count FROM translations t JOIN ocr_blocks b ON b.id = t.ocr_block_id JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ? AND t.is_active = 1').get(chapter.id).count,
+      job_id: job?.id || null,
+      job_type: job?.type || null,
+      job_status: job?.status || null,
+      job_stage: job?.current_stage || null,
+      job_progress: job?.progress ?? null,
+      job_error: job?.error_message || null,
+    };
+  });
+}
+
+function latestJob(chapterId) {
+  return db.prepare('SELECT * FROM jobs WHERE chapter_id = ? ORDER BY created_at DESC LIMIT 1').get(chapterId) || null;
 }
 
 function getChapter(id) {
@@ -718,6 +820,16 @@ function enqueueOcr(jobId) {
   void drainOcrQueue();
 }
 
+function queueOcrJob(chapterId) {
+  const activeJob = db.prepare(`SELECT id FROM jobs WHERE chapter_id = ? AND type = 'ocr' AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`).get(chapterId);
+  if (activeJob) return activeJob.id;
+  const jobId = crypto.randomUUID();
+  db.prepare(`INSERT INTO jobs (id, chapter_id, type, status, current_stage, progress, created_at)
+    VALUES (?, ?, 'ocr', 'queued', 'ocr', 0, ?)`).run(jobId, chapterId, new Date().toISOString());
+  enqueueOcr(jobId);
+  return jobId;
+}
+
 async function drainOcrQueue() {
   if (ocrActive) return;
   ocrActive = true;
@@ -741,6 +853,7 @@ async function runOcrJob(jobId) {
   try {
     await clearOcrResults(job.chapter_id);
     worker = await createOcrWorker(config);
+    activeOcrWorkers.set(jobId, worker);
     const detections = [];
     for (const [index, page] of pages.entries()) {
       if (isJobCancelled(jobId)) return;
@@ -770,9 +883,11 @@ async function runOcrJob(jobId) {
     }
     const finishedAt = new Date().toISOString();
     db.prepare(`UPDATE jobs SET status = 'completed', current_stage = 'completed', progress = 100, finished_at = ?, error_message = NULL WHERE id = ?`).run(finishedAt, jobId);
+    queueAutoTranslationJob(job.chapter_id);
   } catch (error) {
     if (!isJobCancelled(jobId)) await failOcrJob(jobId, error.message || 'OCR 처리에 실패했습니다.');
   } finally {
+    activeOcrWorkers.delete(jobId);
     if (worker) await worker.terminate().catch(() => undefined);
   }
 }
@@ -812,6 +927,32 @@ async function failOcrJob(jobId, message) {
 function enqueueAutoTranslation(jobId) {
   if (!autoTranslationQueue.includes(jobId)) autoTranslationQueue.push(jobId);
   void drainAutoTranslationQueue();
+}
+
+function queueAutoTranslationJob(chapterId) {
+  const blockCount = db.prepare(`SELECT COUNT(*) AS count FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ?`).get(chapterId).count;
+  if (!blockCount) return null;
+  const activeJob = db.prepare(`SELECT id FROM jobs WHERE chapter_id = ? AND type = 'auto_translate' AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`).get(chapterId);
+  if (activeJob) return activeJob.id;
+  const jobId = crypto.randomUUID();
+  db.prepare(`INSERT INTO jobs (id, chapter_id, type, status, current_stage, progress, created_at)
+    VALUES (?, ?, 'auto_translate', 'queued', 'translation', 0, ?)`).run(jobId, chapterId, new Date().toISOString());
+  enqueueAutoTranslation(jobId);
+  return jobId;
+}
+
+function recoverJobs() {
+  const jobs = db.prepare(`SELECT * FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at`).all();
+  for (const job of jobs) {
+    if (job.status === 'running') {
+      db.prepare(`UPDATE jobs SET status = 'queued', current_stage = ?, progress = 0, started_at = NULL WHERE id = ?`)
+        .run(job.type === 'ocr' ? 'ocr' : job.type === 'auto_translate' ? 'translation' : job.type === 'render' ? 'rendering' : 'preparing', job.id);
+    }
+    if (job.type === 'ocr') enqueueOcr(job.id);
+    else if (job.type === 'auto_translate') enqueueAutoTranslation(job.id);
+    else if (job.type === 'render') enqueueRender(job.id);
+    else enqueueIngest(job.id);
+  }
 }
 
 async function drainAutoTranslationQueue() {
@@ -1243,6 +1384,7 @@ async function runIngestJob(jobId) {
     const finishedAt = new Date().toISOString();
     db.prepare(`UPDATE jobs SET status = 'completed', current_stage = 'completed', progress = 100, finished_at = ?, error_message = NULL WHERE id = ?`).run(finishedAt, jobId);
     db.prepare(`UPDATE chapters SET processing_status = 'completed', updated_at = ? WHERE id = ?`).run(finishedAt, chapter.id);
+    queueOcrJob(chapter.id);
   } catch (error) {
     await clearGeneratedPages(chapter.id);
     if (error instanceof IngestCancelledError || isJobCancelled(jobId)) return;
@@ -1326,7 +1468,8 @@ async function failIngestJob(jobId, message) {
 }
 
 function isJobCancelled(jobId) {
-  return db.prepare('SELECT status FROM jobs WHERE id = ?').get(jobId)?.status === 'cancelled';
+  const status = db.prepare('SELECT status FROM jobs WHERE id = ?').get(jobId)?.status;
+  return !status || status === 'cancelled';
 }
 
 class IngestCancelledError extends Error {}
