@@ -9,9 +9,12 @@
     "test": "node --test"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^1.0.9",
     "argon2": "^0.41.1",
     "better-sqlite3": "^11.8.1",
     "express": "^5.1.0",
-    "multer": "^2.0.2"
+    "multer": "^2.0.2",
+    "pdfjs-dist": "^4.10.38",
+    "unzipper": "^0.12.5"
   }
 }

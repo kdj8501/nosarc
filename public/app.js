@@ -1,4 +1,4 @@
-const state = { series: [], reader: null };
+const state = { series: [], reader: null, detailSeriesId: null };
 const $ = (selector) => document.querySelector(selector);
 
 document.addEventListener('DOMContentLoaded', boot);
@@ -59,6 +59,7 @@ function openChapter(id, title) {
 async function openSeries(id) {
   const series = await request(`/api/series/${id}`);
   if (!series) return;
+  state.detailSeriesId = id;
   $('#series-detail-title').textContent = series.title;
   $('#series-detail-description').textContent = series.description || '작품 설명이 없습니다.';
   $('#series-detail-tags').innerHTML = series.tags ? series.tags.split(', ').map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join('') : '';
@@ -66,12 +67,31 @@ async function openSeries(id) {
   $('#chapter-list').innerHTML = series.chapters.length ? series.chapters.map(renderChapter).join('') : '<p class="muted">등록된 권이 없습니다.</p>';
   $('#series-detail-dialog').showModal();
   document.querySelectorAll('[data-read]').forEach((button) => button.addEventListener('click', () => openReader(button.dataset.read)));
+  document.querySelectorAll('[data-retry]').forEach((button) => button.addEventListener('click', () => retryJob(button.dataset.retry)));
+  document.querySelectorAll('[data-cancel]').forEach((button) => button.addEventListener('click', () => cancelJob(button.dataset.cancel)));
 }
 
 function renderChapter(chapter) {
   const readable = chapter.page_count > 0 && chapter.processing_status === 'completed';
-  const status = readable ? `${chapter.page_count}페이지` : chapter.processing_status === 'preparing' ? '변환 대기' : chapter.processing_status;
-  return `<article class="chapter-row"><div><strong>${escapeHtml(chapter.number_label)}${chapter.title ? ` · ${escapeHtml(chapter.title)}` : ''}</strong><span class="muted">${escapeHtml(status)}</span></div><button class="button small ${readable ? 'primary' : 'ghost'}" data-read="${chapter.id}" ${readable ? '' : 'disabled'}>${readable ? '읽기' : '준비 중'}</button></article>`;
+  const statusLabels = { queued: '대기 중', preparing: '변환 중', failed: '실패', cancelled: '취소됨' };
+  const status = readable ? `${chapter.page_count}페이지` : statusLabels[chapter.processing_status] || chapter.processing_status;
+  const action = readable ? `<button class="button small primary" data-read="${chapter.id}">읽기</button>` : chapter.processing_status === 'failed' && chapter.job_id ? `<button class="button small primary" data-retry="${chapter.job_id}">재시도</button>` : ['queued', 'preparing'].includes(chapter.processing_status) && chapter.job_id ? `<button class="button small ghost" data-cancel="${chapter.job_id}">취소</button>` : `<button class="button small ghost" disabled>준비 중</button>`;
+  return `<article class="chapter-row"><div><strong>${escapeHtml(chapter.number_label)}${chapter.title ? ` · ${escapeHtml(chapter.title)}` : ''}</strong><span class="muted">${escapeHtml(status)}</span></div>${action}</article>`;
+}
+
+async function retryJob(jobId) {
+  const result = await request(`/api/jobs/${jobId}/retry`, { method: 'POST' });
+  if (!result) return;
+  showNotice('작업을 다시 접수했습니다.');
+  await openSeries(state.detailSeriesId);
+  watchJob(jobId);
+}
+
+async function cancelJob(jobId) {
+  const result = await request(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
+  if (!result) return;
+  showNotice('작업을 취소했습니다.');
+  await openSeries(state.detailSeriesId);
 }
 
 async function openReader(id) {
@@ -121,7 +141,25 @@ async function uploadChapter(event) {
   $('#chapter-dialog').close();
   event.target.reset();
   await loadSeries($('#search').value);
-  showNotice('업로드를 접수했습니다. 원본과 페이지를 저장했습니다.');
+  if (result.chapter?.job?.id) {
+    showNotice('업로드를 접수했습니다. 페이지 변환을 시작합니다.');
+    watchJob(result.chapter.job.id);
+  } else {
+    showNotice('업로드를 접수했습니다. 원본과 페이지를 저장했습니다.');
+  }
+}
+
+async function watchJob(jobId) {
+  const job = await request(`/api/jobs/${jobId}`);
+  if (!job) return;
+  if (['completed', 'failed', 'cancelled'].includes(job.status)) {
+    const message = job.status === 'completed' ? '페이지 변환이 완료되었습니다.' : job.status === 'failed' ? `페이지 변환 실패: ${job.error_message || '원인을 확인해 주세요.'}` : '페이지 변환이 취소되었습니다.';
+    showNotice(message, job.status !== 'completed');
+    await loadSeries($('#search').value);
+    if ($('#series-detail-dialog').open && state.detailSeriesId) await openSeries(state.detailSeriesId);
+    return;
+  }
+  setTimeout(() => watchJob(jobId), 1000);
 }
 
 async function request(url, options = {}) {

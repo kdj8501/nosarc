@@ -2,12 +2,15 @@ import 'node:process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import * as canvas from '@napi-rs/canvas';
 import Database from 'better-sqlite3';
 import express from 'express';
 import multer from 'multer';
+import unzipper from 'unzipper';
 
 import {
   createSessionToken,
@@ -16,6 +19,16 @@ import {
   verifyPassword,
   verifySessionToken,
 } from './security.mjs';
+
+globalThis.DOMMatrix = canvas.DOMMatrix;
+globalThis.ImageData = canvas.ImageData;
+globalThis.Path2D = canvas.Path2D;
+if (typeof process.getBuiltinModule !== 'function') {
+  const requireBuiltin = createRequire(import.meta.url);
+  process.getBuiltinModule = (name) => requireBuiltin(name);
+}
+const { createCanvas } = canvas;
+const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 loadDotEnv(path.join(ROOT, '.env'));
@@ -31,6 +44,9 @@ const config = {
   mediaRoot: resolveFromRoot(process.env.MEDIA_ROOT || './data/media'),
   maxUploadBytes: Number(process.env.MAX_UPLOAD_BYTES || 1073741824),
   maxPages: Number(process.env.MAX_PAGES_PER_CHAPTER || 500),
+  maxPageBytes: Number(process.env.MAX_PAGE_BYTES || 67108864),
+  maxExtractedBytes: Number(process.env.MAX_EXTRACTED_BYTES || 536870912),
+  pdfRenderWidth: Number(process.env.PDF_RENDER_WIDTH || 1600),
 };
 
 if (config.env === 'production' && !config.sessionSecret) {
@@ -112,6 +128,8 @@ db.exec(`
 `);
 
 const sessions = new Map();
+const ingestQueue = [];
+let ingestActive = false;
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '2mb' }));
@@ -122,7 +140,8 @@ const upload = multer({
   dest: uploadRoot,
   limits: { fileSize: config.maxUploadBytes, files: config.maxPages },
   fileFilter: (_req, file, callback) => {
-    if (allowedMimeTypes.has(file.mimetype.toLowerCase())) return callback(null, true);
+    const extension = path.extname(file.originalname).toLowerCase();
+    if (allowedMimeTypes.has(file.mimetype.toLowerCase()) || allowedArchiveExtensions.has(extension)) return callback(null, true);
     callback(new Error(`Unsupported file type: ${file.mimetype}`));
   },
 });
@@ -137,6 +156,7 @@ const allowedMimeTypes = new Set([
   'application/zip',
   'application/x-cbz',
 ]);
+const allowedArchiveExtensions = new Set(['.zip', '.cbz']);
 
 app.get('/api/session', (req, res) => {
   res.json({ authenticated: Boolean(getSession(req)) });
@@ -249,7 +269,9 @@ app.post('/api/series/:id/chapters', upload.array('files', config.maxPages), asy
     const first = files[0];
     const sourceAsset = await saveAsset(first, 'source');
     const pageCount = files.every((file) => file.mimetype.startsWith('image/')) ? files.length : 0;
-    const status = files.length === 1 && !first.mimetype.startsWith('image/') ? 'preparing' : 'completed';
+    const needsIngest = files.length === 1 && !first.mimetype.startsWith('image/');
+    const status = needsIngest ? 'queued' : 'completed';
+    let jobId = null;
 
     const insert = db.transaction(() => {
       db.prepare(`INSERT INTO chapters (id, series_id, number_label, sort_key, title, source_asset_id, page_count, processing_status, created_at, updated_at)
@@ -261,9 +283,10 @@ app.post('/api/series/:id/chapters', upload.array('files', config.maxPages), asy
           insertPage(chapterId, index, asset, file);
         }
       });
-      if (files.length === 1 && !first.mimetype.startsWith('image/')) {
+      if (needsIngest) {
+        jobId = crypto.randomUUID();
         db.prepare(`INSERT INTO jobs (id, chapter_id, type, status, current_stage, progress, created_at) VALUES (?, ?, 'ingest', 'queued', 'preparing', 0, ?)`)
-          .run(crypto.randomUUID(), chapterId, now);
+          .run(jobId, chapterId, now);
       }
     });
     insert();
@@ -275,7 +298,8 @@ app.post('/api/series/:id/chapters', upload.array('files', config.maxPages), asy
         .run(crypto.randomUUID(), chapterId, index, asset.id, asset.width, asset.height);
     }
     db.prepare('UPDATE series SET updated_at = ? WHERE id = ?').run(new Date().toISOString(), series.id);
-    res.status(202).json({ id: chapterId, status, chapter: getChapter(chapterId) });
+    if (jobId) enqueueIngest(jobId);
+    res.status(202).json({ id: chapterId, status, job_id: jobId, chapter: getChapter(chapterId) });
   } catch (error) {
     next(error);
   }
@@ -291,6 +315,31 @@ app.get('/api/jobs/:id', (req, res) => {
   const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(req.params.id);
   if (!job) return res.status(404).json({ error: '작업을 찾을 수 없습니다.' });
   res.json(job);
+});
+
+app.post('/api/jobs/:id/retry', (req, res) => {
+  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(req.params.id);
+  if (!job) return res.status(404).json({ error: '작업을 찾을 수 없습니다.' });
+  if (!['failed', 'cancelled'].includes(job.status)) return res.status(409).json({ error: '실패하거나 취소된 작업만 재시도할 수 있습니다.' });
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    db.prepare(`UPDATE jobs SET status = 'queued', current_stage = 'preparing', progress = 0, error_message = NULL, started_at = NULL, finished_at = NULL WHERE id = ?`).run(job.id);
+    db.prepare(`UPDATE chapters SET processing_status = 'queued', updated_at = ? WHERE id = ?`).run(now, job.chapter_id);
+  })();
+  enqueueIngest(job.id);
+  res.status(202).json({ id: job.id, status: 'queued' });
+});
+
+app.post('/api/jobs/:id/cancel', (req, res) => {
+  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(req.params.id);
+  if (!job) return res.status(404).json({ error: '작업을 찾을 수 없습니다.' });
+  if (!['queued', 'running'].includes(job.status)) return res.status(409).json({ error: '대기 중이거나 진행 중인 작업만 취소할 수 있습니다.' });
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    db.prepare(`UPDATE jobs SET status = 'cancelled', current_stage = 'cancelled', finished_at = ? WHERE id = ?`).run(now, job.id);
+    db.prepare(`UPDATE chapters SET processing_status = 'cancelled', updated_at = ? WHERE id = ?`).run(now, job.chapter_id);
+  })();
+  res.json({ id: job.id, status: 'cancelled' });
 });
 
 app.get('/media/:id', (req, res) => {
@@ -345,7 +394,11 @@ function getSeries(id) {
 
 function listChapters(seriesId) {
   return db.prepare(`SELECT c.*, a.original_name AS source_name FROM chapters c JOIN assets a ON a.id = c.source_asset_id
-    WHERE c.series_id = ? ORDER BY c.sort_key ASC, c.created_at ASC`).all(seriesId);
+    WHERE c.series_id = ? ORDER BY c.sort_key ASC, c.created_at ASC`).all(seriesId).map((chapter) => ({
+    ...chapter,
+    job_id: db.prepare('SELECT id FROM jobs WHERE chapter_id = ? ORDER BY created_at DESC LIMIT 1').get(chapter.id)?.id || null,
+    job_status: db.prepare('SELECT status FROM jobs WHERE chapter_id = ? ORDER BY created_at DESC LIMIT 1').get(chapter.id)?.status || null,
+  }));
 }
 
 function getChapter(id) {
@@ -354,7 +407,158 @@ function getChapter(id) {
   if (!chapter) return null;
   chapter.pages = db.prepare(`SELECT p.*, a.mime_type, a.original_name, a.id AS asset_id FROM pages p JOIN assets a ON a.id = p.image_asset_id
     WHERE p.chapter_id = ? ORDER BY p.page_index`).all(id).map((page) => ({ ...page, media_url: `/media/${page.asset_id}` }));
+  chapter.job = db.prepare(`SELECT * FROM jobs WHERE chapter_id = ? ORDER BY created_at DESC LIMIT 1`).get(id) || null;
   return chapter;
+}
+
+function enqueueIngest(jobId) {
+  if (!ingestQueue.includes(jobId)) ingestQueue.push(jobId);
+  void drainIngestQueue();
+}
+
+async function drainIngestQueue() {
+  if (ingestActive) return;
+  ingestActive = true;
+  try {
+    while (ingestQueue.length) {
+      await runIngestJob(ingestQueue.shift());
+    }
+  } finally {
+    ingestActive = false;
+  }
+}
+
+async function runIngestJob(jobId) {
+  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
+  if (!job || job.status === 'cancelled') return;
+  const chapter = db.prepare('SELECT * FROM chapters WHERE id = ?').get(job.chapter_id);
+  const sourceAsset = chapter && db.prepare('SELECT * FROM assets WHERE id = ?').get(chapter.source_asset_id);
+  if (!chapter || !sourceAsset) return failIngestJob(jobId, '원본 자산을 찾을 수 없습니다.');
+
+  const sourcePath = assetPath(sourceAsset);
+  const extension = path.extname(sourceAsset.original_name).toLowerCase();
+  const isPdf = sourceAsset.mime_type === 'application/pdf' || extension === '.pdf';
+  const isArchive = sourceAsset.mime_type === 'application/zip' || sourceAsset.mime_type === 'application/x-cbz' || ['.zip', '.cbz'].includes(extension);
+  const stage = isPdf ? 'rendering' : isArchive ? 'extracting' : 'preparing';
+
+  db.prepare(`UPDATE jobs SET status = 'running', current_stage = ?, progress = 1, started_at = ?, error_message = NULL WHERE id = ?`)
+    .run(stage, new Date().toISOString(), jobId);
+  db.prepare(`UPDATE chapters SET processing_status = 'preparing', updated_at = ? WHERE id = ?`).run(new Date().toISOString(), chapter.id);
+
+  try {
+    await clearGeneratedPages(chapter.id);
+    let pageCount = 0;
+    const handlePage = async (page, index, total) => {
+      if (isJobCancelled(jobId)) throw new IngestCancelledError();
+      const asset = await saveBufferAsset(page.buffer, page.originalName, page.mimeType, 'page');
+      db.prepare('INSERT INTO pages (id, chapter_id, page_index, image_asset_id, width, height) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(crypto.randomUUID(), chapter.id, index, asset.id, asset.width || null, asset.height || null);
+      pageCount = index + 1;
+      const progress = total ? Math.min(95, 5 + Math.round((pageCount / total) * 90)) : 5;
+      db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(progress, jobId);
+      db.prepare('UPDATE chapters SET page_count = ?, updated_at = ? WHERE id = ?').run(pageCount, new Date().toISOString(), chapter.id);
+    };
+
+    if (isPdf) await renderPdfPages(sourcePath, handlePage);
+    else if (isArchive) await extractArchivePages(sourcePath, handlePage);
+    else throw new Error('지원하지 않는 원본 형식입니다.');
+    if (!pageCount) throw new Error('원본에서 이미지 페이지를 찾지 못했습니다.');
+
+    const finishedAt = new Date().toISOString();
+    db.prepare(`UPDATE jobs SET status = 'completed', current_stage = 'completed', progress = 100, finished_at = ?, error_message = NULL WHERE id = ?`).run(finishedAt, jobId);
+    db.prepare(`UPDATE chapters SET processing_status = 'completed', updated_at = ? WHERE id = ?`).run(finishedAt, chapter.id);
+  } catch (error) {
+    await clearGeneratedPages(chapter.id);
+    if (error instanceof IngestCancelledError || isJobCancelled(jobId)) return;
+    await failIngestJob(jobId, error.message || '페이지 변환에 실패했습니다.');
+  }
+}
+
+async function renderPdfPages(filePath, onPage) {
+  const pdfData = new Uint8Array(await fsp.readFile(filePath));
+  const pdf = await getDocument({ data: pdfData, disableWorker: true, useSystemFonts: true }).promise;
+  try {
+    if (pdf.numPages > config.maxPages) throw new Error(`PDF 페이지 수가 제한(${config.maxPages}페이지)을 초과했습니다.`);
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      try {
+        const baseViewport = page.getViewport({ scale: 1 });
+        const scale = Math.min(2, config.pdfRenderWidth / baseViewport.width);
+        const viewport = page.getViewport({ scale: Math.max(scale, 0.5) });
+        const output = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+        await page.render({ canvasContext: output.getContext('2d'), viewport }).promise;
+        const buffer = output.toBuffer('image/png');
+        if (buffer.length > config.maxPageBytes) throw new Error(`PDF 페이지가 제한(${Math.round(config.maxPageBytes / 1024 / 1024)}MB)을 초과했습니다.`);
+        await onPage({ buffer, originalName: `page-${String(pageNumber).padStart(4, '0')}.png`, mimeType: 'image/png' }, pageNumber - 1, pdf.numPages);
+      } finally {
+        page.cleanup();
+      }
+    }
+  } finally {
+    await pdf.destroy();
+  }
+}
+
+async function extractArchivePages(filePath, onPage) {
+  const directory = await unzipper.Open.file(filePath);
+  const files = directory.files.filter((entry) => entry.type === undefined || entry.type === 'File');
+  for (const entry of directory.files) {
+    if (!isSafeArchivePath(entry.path)) throw new Error('압축 파일에 안전하지 않은 경로가 포함되어 있습니다.');
+    if (entry.type && !['File', 'Directory'].includes(entry.type)) throw new Error('압축 파일에 지원하지 않는 링크가 포함되어 있습니다.');
+  }
+  const imageEntries = files
+    .filter((entry) => imageMimeForExtension(path.extname(entry.path).toLowerCase()))
+    .sort((left, right) => left.path.localeCompare(right.path, undefined, { numeric: true, sensitivity: 'base' }));
+  if (imageEntries.length > config.maxPages) throw new Error(`압축 파일 페이지 수가 제한(${config.maxPages}페이지)을 초과했습니다.`);
+  if (!imageEntries.length) throw new Error('압축 파일에서 이미지 페이지를 찾지 못했습니다.');
+
+  let expandedBytes = 0;
+  for (const [index, entry] of imageEntries.entries()) {
+    const declaredSize = Number(entry.vars?.uncompressedSize || 0);
+    if (declaredSize > config.maxPageBytes || expandedBytes + declaredSize > config.maxExtractedBytes) {
+      throw new Error('압축 해제 후 파일 크기 제한을 초과했습니다.');
+    }
+    const buffer = await entry.buffer();
+    if (buffer.length > config.maxPageBytes || expandedBytes + buffer.length > config.maxExtractedBytes) {
+      throw new Error('압축 해제 후 파일 크기 제한을 초과했습니다.');
+    }
+    expandedBytes += buffer.length;
+    await onPage({
+      buffer,
+      originalName: path.basename(entry.path),
+      mimeType: imageMimeForExtension(path.extname(entry.path).toLowerCase()),
+    }, index, imageEntries.length);
+  }
+}
+
+async function clearGeneratedPages(chapterId) {
+  const assets = db.prepare('SELECT a.* FROM assets a JOIN pages p ON p.image_asset_id = a.id WHERE p.chapter_id = ?').all(chapterId);
+  db.transaction(() => {
+    db.prepare('DELETE FROM pages WHERE chapter_id = ?').run(chapterId);
+    for (const asset of assets) db.prepare('DELETE FROM assets WHERE id = ?').run(asset.id);
+  })();
+  await Promise.all(assets.map((asset) => fsp.unlink(assetPath(asset)).catch(() => undefined)));
+}
+
+async function failIngestJob(jobId, message) {
+  const current = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
+  if (!current || current.status === 'cancelled') return;
+  const now = new Date().toISOString();
+  const safeMessage = String(message).slice(0, 500);
+  db.prepare(`UPDATE jobs SET status = 'failed', current_stage = 'failed', error_message = ?, finished_at = ? WHERE id = ?`).run(safeMessage, now, jobId);
+  db.prepare(`UPDATE chapters SET processing_status = 'failed', updated_at = ? WHERE id = ?`).run(now, current.chapter_id);
+}
+
+function isJobCancelled(jobId) {
+  return db.prepare('SELECT status FROM jobs WHERE id = ?').get(jobId)?.status === 'cancelled';
+}
+
+class IngestCancelledError extends Error {}
+
+function assetPath(asset) {
+  const filePath = path.resolve(config.mediaRoot, asset.storage_key);
+  if (!filePath.startsWith(`${path.resolve(config.mediaRoot)}${path.sep}`)) throw new Error('잘못된 자산 경로입니다.');
+  return filePath;
 }
 
 function attachTags(seriesId, values) {
@@ -390,6 +594,18 @@ async function saveAsset(file, kind) {
   return { id, storageKey, width: dimensions.width, height: dimensions.height };
 }
 
+async function saveBufferAsset(buffer, originalName, mimeType, kind) {
+  if (buffer.length > config.maxPageBytes) throw new Error('페이지 파일 크기 제한을 초과했습니다.');
+  const id = crypto.randomUUID();
+  const storageKey = `${id}${extensionFor(originalName, mimeType)}`;
+  const destination = path.join(config.mediaRoot, storageKey);
+  await fsp.writeFile(destination, buffer, { flag: 'wx' });
+  const dimensions = mimeType.startsWith('image/') ? await readImageSize(destination, mimeType) : {};
+  db.prepare(`INSERT INTO assets (id, storage_key, original_name, mime_type, byte_size, sha256, kind, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(id, storageKey, path.basename(originalName), mimeType, buffer.length, crypto.createHash('sha256').update(buffer).digest('hex'), kind, new Date().toISOString());
+  return { id, storageKey, width: dimensions.width, height: dimensions.height };
+}
+
 async function readImageSize(filePath, mimeType) {
   const buffer = await fsp.readFile(filePath);
   if (mimeType === 'image/png') return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
@@ -419,6 +635,16 @@ function extensionFor(name, mime) {
   const ext = path.extname(name).toLowerCase().replace(/[^a-z0-9.]/g, '');
   if (ext && ext.length <= 8) return ext;
   return ({ 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif', 'image/tiff': '.tiff', 'application/pdf': '.pdf', 'application/zip': '.zip', 'application/x-cbz': '.cbz' })[mime] || '.bin';
+}
+
+function imageMimeForExtension(extension) {
+  return ({ '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif', '.tif': 'image/tiff', '.tiff': 'image/tiff' })[extension] || null;
+}
+
+function isSafeArchivePath(value) {
+  const normalized = String(value).replaceAll('\\', '/');
+  const clean = path.posix.normalize(normalized);
+  return Boolean(normalized) && !normalized.includes('\0') && !clean.startsWith('/') && clean !== '..' && !clean.startsWith('../');
 }
 
 function parseSortKey(value) {
