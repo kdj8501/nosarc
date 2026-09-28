@@ -25,7 +25,7 @@
 
 리더에서 `번역 편집`을 누르면 OCR 블록별 번역문을 입력하고 세로쓰기/가로쓰기와 글자 크기를 저장할 수 있습니다. 저장된 결과는 번역 모드의 식자 레이어로 표시됩니다. 역식 데이터 API는 `POST /api/pages/:id/ocr-blocks`, `POST /api/ocr-blocks/:id/translations`, `PATCH /api/lettering-layers/:id`이며, 좌표는 페이지 기준 0~1 정규화 좌표를 사용합니다.
 
-권을 업로드하면 페이지 준비 → OCR → 로컬 자동 번역·식자 작업이 순서대로 백그라운드에서 실행됩니다. 화면의 처리 패널에서 단계와 진행률을 확인할 수 있으며, 자동 역식이 끝나면 번역된 만화 리더를 바로 엽니다. 번역은 블록별 CTranslate2/NLLB 추론을 사용하고 기본 빔 크기는 4입니다. 한국어 자동 식자는 가로쓰기를 우선하고, 매우 좁은 상자 안의 짧은 문구만 세로쓰기를 유지합니다. 렌더러는 번역문을 OCR 상자 안에서 자동 축소·단어 단위 줄바꿈하고 상자 밖으로 넘치지 않게 자릅니다. LaMa 모델이 없으면 4방향 주변 픽셀을 이용한 CPU 보간으로 원문 영역을 채웁니다. 이 보간은 만화 전용 인페인팅 모델의 복원 품질과 같지 않습니다.
+권을 업로드하면 페이지 준비 → OCR → 로컬 자동 번역·식자 작업이 순서대로 백그라운드에서 실행됩니다. 화면의 처리 패널에서 단계와 진행률을 확인할 수 있으며, 자동 역식이 끝나면 번역된 만화 리더를 바로 엽니다. 번역은 블록별 CTranslate2/NLLB 추론을 사용하고 기본 빔 크기는 4입니다. 한국어 자동 식자는 가로쓰기를 우선하고, 매우 좁은 상자 안의 짧은 문구만 세로쓰기를 유지합니다. 렌더러는 복원된 페이지 위에 불투명한 사각 배경을 덮지 않고 얇은 글자 외곽선으로 대비를 보강합니다. 글자 크기를 OCR 상자에 맞추고 단어와 문장부호 단위로 줄바꿈합니다. LaMa 모델이 없으면 4방향 주변 픽셀을 이용한 CPU 보간으로 원문 영역을 채웁니다. 이 보간은 만화 전용 인페인팅 모델의 복원 품질과 같지 않습니다.
 
 ## OCR 모델 준비
 
@@ -66,7 +66,7 @@ Windows에서는 기본적으로 `C:\Windows\Fonts\malgun.ttf`를 식자 폰트�
 
 기본 번역 모델은 일본어(`jpn_Jpan`)와 한국어(`kor_Hang`)를 지원하는 NLLB-200 distilled 600M이며, `data/models/nllb-200-distilled-600M`에 준비한 뒤 CTranslate2 형식으로 변환합니다. N100에서는 변환 후 INT8 모델만 실행합니다. 모델 경로와 언어 코드는 `.env`의 `AI_TRANSLATION_MODEL_PATH`, `AI_TRANSLATION_TOKENIZER_PATH`, `AI_TRANSLATION_SOURCE_CODE`, `AI_TRANSLATION_TARGET_CODE`로 바꿀 수 있습니다.
 
-대사 문맥과 자연스러운 구어체를 더 반영하려면 Ollama 품질 모드를 사용할 수 있습니다. Ollama를 설치한 뒤 `ollama pull qwen3:4b-instruct`로 약 2.5 GB 모델을 받고, `.env`에서 `AI_TRANSLATION_PROVIDER=ollama`로 바꿔 서버를 다시 시작하세요. 이 모드는 같은 페이지의 앞뒤 말풍선을 문맥으로 제공하고, 번역은 로컬에서 처리합니다. NLLB보다 N100 CPU에서 느릴 수 있습니다. 모델과 주소는 `AI_TRANSLATION_OLLAMA_MODEL`, `AI_TRANSLATION_OLLAMA_URL`로 조정할 수 있습니다.
+대사 문맥과 자연스러운 구어체를 더 반영하려면 Ollama 품질 모드를 사용할 수 있습니다. Ollama를 설치한 뒤 `ollama pull qwen3:4b-instruct`로 약 2.5 GB 모델을 받고, `.env`에서 `AI_TRANSLATION_PROVIDER=ollama`로 바꿔 서버를 다시 시작하세요. 이 모드는 같은 페이지에서 앞뒤 최대 두 말풍선의 원문을 함께 전달해 생략된 주어와 말투를 판단하고, 확신도 높은 인명·지명·작품 내 용어를 장 단위 용어집에 추가해 이후 표기의 일관성을 높입니다. 번역은 로컬에서 처리합니다. 기본 CTranslate2/NLLB 경로는 블록마다 독립 번역하므로 이웃 대사나 용어집을 참고하지 않습니다. Ollama는 N100 CPU에서 더 느릴 수 있습니다. 모델과 주소는 `AI_TRANSLATION_OLLAMA_MODEL`, `AI_TRANSLATION_OLLAMA_URL`로 조정할 수 있습니다.
 
 ```powershell
 & .\ai-worker\.venv\Scripts\hf.exe download facebook/nllb-200-distilled-600M --local-dir data/models/nllb-200-distilled-600M

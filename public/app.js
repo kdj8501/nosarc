@@ -253,8 +253,9 @@ function renderLetteringLayer(layer) {
   const bounds = polygonBounds(layer.polygon);
   const style = layer.style || {};
   const fontSize = Math.min(96, Math.max(8, Number(style.fontSize) || 24));
-  const color = /^#[0-9a-f]{6}$/i.test(style.color || '') ? style.color : '#ffffff';
-  const background = /^rgba?\([0-9.,% ]+\)$/.test(style.background || '') ? style.background : 'rgba(20, 14, 25, 0.72)';
+  const color = /^#[0-9a-f]{6}$/i.test(style.color || '') ? style.color : '#21121a';
+  const savedBackground = /^rgba?\([0-9.,% ]+\)$/.test(style.background || '') ? style.background : 'rgba(255, 255, 255, 0)';
+  const background = savedBackground === 'rgba(255, 255, 255, 0.92)' ? 'rgba(255, 255, 255, 0)' : savedBackground;
   const writingMode = ['vertical-rl', 'horizontal-tb'].includes(style.writingMode) ? style.writingMode : 'vertical-rl';
   const textAlign = ['center', 'left', 'right'].includes(style.textAlign) ? style.textAlign : 'center';
   const fontWeight = ['400', '600', '700'].includes(String(style.fontWeight)) ? style.fontWeight : '600';
@@ -286,7 +287,9 @@ function renderTranslationEditor() {
   $('#translation-editor-list').innerHTML = entries.length ? entries.map(({ page, pageIndex, block }) => {
     const layer = (page.lettering_layers || []).find((candidate) => candidate.translation_id === block.translation?.id);
     const style = layer?.style || {};
-    return `<article class="translation-entry"><div class="translation-source"><span class="eyebrow">PAGE ${pageIndex + 1}</span><p>${escapeHtml(block.source_text)}</p><span class="muted">신뢰도 ${block.confidence == null ? '-' : `${Math.round(block.confidence * 100)}%`}</span></div><textarea data-translation-text="${block.id}" rows="2" placeholder="번역문을 입력하세요.">${escapeHtml(block.translation?.translated_text || '')}</textarea><div class="translation-controls"><select data-writing-mode="${block.id}" aria-label="쓰기 방향"><option value="vertical-rl" ${style.writingMode !== 'horizontal-tb' ? 'selected' : ''}>세로쓰기</option><option value="horizontal-tb" ${style.writingMode === 'horizontal-tb' ? 'selected' : ''}>가로쓰기</option></select><input data-font-size="${block.id}" type="number" min="8" max="96" value="${Number(style.fontSize) || 24}" aria-label="글자 크기" /><span class="muted">px</span><button class="button small primary" data-save-translation="${block.id}">저장</button></div></article>`;
+    const defaultWritingMode = /^(?:ko|kor)(?:[-_]|$)/i.test(state.reader.chapter.target_language || '') ? 'horizontal-tb' : 'vertical-rl';
+    const writingMode = ['vertical-rl', 'horizontal-tb'].includes(style.writingMode) ? style.writingMode : defaultWritingMode;
+    return `<article class="translation-entry"><div class="translation-source"><span class="eyebrow">PAGE ${pageIndex + 1}</span><p>${escapeHtml(block.source_text)}</p><span class="muted">신뢰도 ${block.confidence == null ? '-' : `${Math.round(block.confidence * 100)}%`}</span></div><textarea data-translation-text="${block.id}" rows="2" placeholder="번역문을 입력하세요.">${escapeHtml(block.translation?.translated_text || '')}</textarea><div class="translation-controls"><select data-writing-mode="${block.id}" aria-label="쓰기 방향"><option value="vertical-rl" ${writingMode !== 'horizontal-tb' ? 'selected' : ''}>세로쓰기</option><option value="horizontal-tb" ${writingMode === 'horizontal-tb' ? 'selected' : ''}>가로쓰기</option></select><input data-font-size="${block.id}" type="number" min="8" max="96" value="${Number(style.fontSize) || 24}" aria-label="글자 크기" /><span class="muted">px</span><button class="button small primary" data-save-translation="${block.id}">저장</button></div></article>`;
   }).join('') : '<p class="muted">OCR 블록이 없습니다. 먼저 OCR을 실행해 주세요.</p>';
   document.querySelectorAll('[data-save-translation]').forEach((button) => button.addEventListener('click', () => saveTranslation(button.dataset.saveTranslation)));
 }
@@ -379,6 +382,29 @@ function renderActivityJob(job) {
   return `<article class="activity-item"><div class="activity-title"><strong>${escapeHtml(job.series_title)} · ${escapeHtml(job.number_label)}</strong><span>${escapeHtml(JOB_LABELS[job.type] || '자동 처리')} · ${escapeHtml(stageLabel(job.type, job.current_stage))}</span></div><div class="progress-wrap"><progress max="100" value="${progress}"></progress><strong>${progress}%</strong></div><button class="button small ghost" data-open-activity="${job.series_id}">상세</button></article>`;
 }
 
+function updateChapterProgress(job) {
+  const row = [...document.querySelectorAll('.chapter-row')].find((candidate) => candidate.querySelector('[data-cancel]')?.dataset.cancel === job.id);
+  if (!row) return;
+  const progress = Math.max(0, Math.min(100, Number(job.progress) || 0));
+  const status = row.querySelector('.chapter-info .muted');
+  if (status) {
+    if (!status.dataset.metadata) status.dataset.metadata = status.textContent.match(/\s·\sOCR\b[\s\S]*/u)?.[0] || '';
+    status.textContent = job.status === 'queued'
+      ? `${JOB_LABELS[job.type] || '작업'} · 대기 중 · ${progress}%${status.dataset.metadata}`
+      : `${JOB_LABELS[job.type] || '작업'} · ${stageLabel(job.type, job.current_stage)} · ${progress}%${status.dataset.metadata}`;
+  }
+  let progressBar = row.querySelector('.chapter-progress progress');
+  if (!progressBar) {
+    const wrap = document.createElement('div');
+    wrap.className = 'chapter-progress';
+    progressBar = document.createElement('progress');
+    progressBar.max = 100;
+    wrap.append(progressBar);
+    row.querySelector('.chapter-info')?.append(wrap);
+  }
+  if (progressBar) progressBar.value = progress;
+}
+
 function showProcessingDialog(job) {
   state.processingJobId = job.id;
   state.processingChapterId = job.chapter_id;
@@ -418,11 +444,15 @@ function pipelineIndex(job) {
 function watchJob(jobId, options = {}) {
   if (!jobId || state.watchedJobs.has(jobId)) return;
   state.watchedJobs.add(jobId);
+  let pollFailures = 0;
   const poll = async () => {
+    try {
     const job = await request(`/api/jobs/${jobId}`, { silentErrors: true });
-    if (!job) { state.watchedJobs.delete(jobId); return; }
+    if (!job?.id) throw new Error('Job status response is unavailable.');
+    pollFailures = 0;
     if (options.showDialog || state.processingJobId === jobId) showProcessingDialog(job);
     if (!['completed', 'failed', 'cancelled'].includes(job.status)) {
+      updateChapterProgress(job);
       await refreshProcessingJobs();
       setTimeout(poll, 1000);
       return;
@@ -449,6 +479,12 @@ function watchJob(jobId, options = {}) {
       updateProcessingDialog(job);
     }
     await refreshProcessingJobs();
+    } catch {
+      pollFailures += 1;
+      state.watchedJobs.add(jobId);
+      if (pollFailures === 5) showNotice('진행 현황 연결이 불안정합니다. 다시 연결을 시도하고 있습니다.', true);
+      setTimeout(poll, Math.min(8000, 1000 + pollFailures * 1000));
+    }
   };
   void poll();
 }

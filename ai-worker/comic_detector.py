@@ -74,8 +74,18 @@ class ComicTextDetector:
             y1, y2 = sorted((max(0, min(height, int(y1))), max(0, min(height, int(y2)))))
             if x2 - x1 < 4 or y2 - y1 < 4:
                 continue
+            mask_polygons = []
+            for line in block.lines:
+                points = np.asarray(line, dtype=np.float32).reshape(-1, 2)
+                if len(points) < 3:
+                    continue
+                mask_polygons.append([
+                    {"x": float(np.clip(point[0] / width, 0, 1)), "y": float(np.clip(point[1] / height, 0, 1))}
+                    for point in points
+                ])
             results.append({
                 "bbox": [x1 / width, y1 / height, x2 / width, y2 / height],
+                "maskPolygons": mask_polygons,
                 "confidence": None,
                 "vertical": bool(block.vertical),
                 "textLineCount": len(block.lines),

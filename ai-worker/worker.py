@@ -251,6 +251,7 @@ def inpaint_lama(request: dict[str, Any]) -> None:
             output = output * 255.0
         output = np.clip(output, 0, 255).astype(np.uint8)[:, :, ::-1]
         output_image = Image.fromarray(output, mode="RGB").resize(original_size, Image.Resampling.BICUBIC)
+        output_image = Image.composite(output_image, image, mask)
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         output_image.save(output_path, format="PNG")
         emit({

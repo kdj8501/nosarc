@@ -23,7 +23,7 @@ import {
 import { createOcrWorker, extractOcrBlocks, recognizePage } from './ocr.mjs';
 import { createInpaintMask, renderTranslatedPage } from './render.mjs';
 import { autoLetteringStyle } from './lettering.mjs';
-import { translateWithOllama } from './translation.mjs';
+import { isKoreanTargetLanguage, isKoreanText, translateWithOllama } from './translation.mjs';
 
 globalThis.DOMMatrix = canvas.DOMMatrix;
 globalThis.ImageData = canvas.ImageData;
@@ -164,6 +164,7 @@ db.exec(`
     id TEXT PRIMARY KEY,
     page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
     polygon_json TEXT NOT NULL,
+    inpaint_mask_json TEXT,
     source_text TEXT NOT NULL,
     source_language TEXT NOT NULL DEFAULT 'ja',
     confidence REAL,
@@ -214,6 +215,10 @@ db.exec(`
 const pageColumns = db.prepare('PRAGMA table_info(pages)').all();
 if (!pageColumns.some((column) => column.name === 'rendered_asset_id')) {
   db.exec('ALTER TABLE pages ADD COLUMN rendered_asset_id TEXT REFERENCES assets(id)');
+}
+const ocrBlockColumns = db.prepare('PRAGMA table_info(ocr_blocks)').all();
+if (!ocrBlockColumns.some((column) => column.name === 'inpaint_mask_json')) {
+  db.exec('ALTER TABLE ocr_blocks ADD COLUMN inpaint_mask_json TEXT');
 }
 
 const sessions = new Map();
@@ -613,7 +618,8 @@ app.patch('/api/lettering-layers/:id', async (req, res) => {
 });
 
 app.get('/api/jobs/:id', (req, res) => {
-  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(req.params.id);
+  const job = db.prepare(`SELECT j.*, c.number_label, c.series_id, s.title AS series_title
+    FROM jobs j JOIN chapters c ON c.id = j.chapter_id JOIN series s ON s.id = c.series_id WHERE j.id = ?`).get(req.params.id);
   if (!job) return res.status(404).json({ error: '작업을 찾을 수 없습니다.' });
   res.json(job);
 });
@@ -928,9 +934,9 @@ function insertOcrBlocks(page, blocks, recognized, modelId, modelVersion) {
     for (const [index, block] of blocks.entries()) {
       const key = `${page.page_index}:${index}`;
       const sourceText = recognized.get(key) || block.sourceText;
-      db.prepare(`INSERT INTO ocr_blocks (id, page_id, polygon_json, source_text, source_language, confidence, reading_order, model_id, model_version, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        crypto.randomUUID(), page.id, JSON.stringify(block.polygon), sourceText, config.ocrLanguage,
+      db.prepare(`INSERT INTO ocr_blocks (id, page_id, polygon_json, inpaint_mask_json, source_text, source_language, confidence, reading_order, model_id, model_version, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        crypto.randomUUID(), page.id, JSON.stringify(block.polygon), JSON.stringify(block.inpaintMask || []), sourceText, config.ocrLanguage,
         block.confidence, block.readingOrder, modelId, modelVersion, now, now,
       );
     }
@@ -1033,12 +1039,16 @@ async function runRenderJob(jobId) {
 async function renderChapterImages(chapterId, jobId = null, onProgress = () => {}) {
   const pages = db.prepare(`SELECT p.*, a.storage_key, a.original_name, a.mime_type
     FROM pages p JOIN assets a ON a.id = p.image_asset_id WHERE p.chapter_id = ? ORDER BY p.page_index`).all(chapterId);
-  const layers = db.prepare(`SELECT l.* FROM lettering_layers l JOIN pages p ON p.id = l.page_id
+  const layers = db.prepare(`SELECT l.*, b.inpaint_mask_json FROM lettering_layers l JOIN pages p ON p.id = l.page_id
+    LEFT JOIN translations t ON t.id = l.translation_id
+    LEFT JOIN ocr_blocks b ON b.id = t.ocr_block_id
     WHERE p.chapter_id = ? AND l.is_active = 1 AND TRIM(l.text) <> '' ORDER BY l.created_at`).all(chapterId);
   const layersByPage = groupBy(layers, 'page_id');
   const workToken = crypto.randomUUID();
   const inpaintPages = [];
+  let completedInpaintProgress = 0;
   try {
+    onProgress(0);
     for (const page of pages) {
       const pageLayers = layersByPage[page.id] || [];
       if (!pageLayers.length) continue;
@@ -1051,16 +1061,23 @@ async function renderChapterImages(chapterId, jobId = null, onProgress = () => {
     let aiOutputs = new Map();
     if (config.inpaintProvider === 'lama' && inpaintPages.length && fs.existsSync(config.inpaintModelPath)) {
       try {
-        aiOutputs = await runLamaInpaintWorker(jobId || workToken, inpaintPages, (progress) => onProgress(Math.min(70, progress * 0.7)));
+        aiOutputs = await runLamaInpaintWorker(jobId || workToken, inpaintPages, (progress) => {
+          const fraction = Math.min(1, Math.max(0, (progress - 5) / 90));
+          completedInpaintProgress = Math.max(completedInpaintProgress, fraction * 45);
+          onProgress(completedInpaintProgress);
+        });
       } catch (error) {
         if (jobId && isJobCancelled(jobId)) return false;
         console.warn(`LaMa 인페인팅을 사용할 수 없어 CPU 보간으로 대체합니다: ${error.message}`);
       }
     }
 
+    const pageRenderProgress = 100 - completedInpaintProgress;
     for (const [index, page] of pages.entries()) {
       if (jobId && isJobCancelled(jobId)) return false;
       const pageLayers = layersByPage[page.id] || [];
+      const pageProgress = (fraction) => completedInpaintProgress
+        + pageRenderProgress * (index + Math.min(1, Math.max(0, fraction))) / Math.max(1, pages.length);
       if (pageLayers.length) {
         const aiOutput = aiOutputs.get(page.id);
         const basePath = aiOutput || assetPath(page);
@@ -1068,12 +1085,13 @@ async function renderChapterImages(chapterId, jobId = null, onProgress = () => {
           inpaintPadding: config.inpaintPadding,
           fontPath: config.letteringFontPath,
           skipInpaint: Boolean(aiOutput),
+          onInpaintProgress: (fraction) => onProgress(pageProgress(fraction)),
         });
         await saveRenderedPage(page, buffer);
       } else {
         await clearRenderedPage(page.id);
       }
-      onProgress(Math.max(70, ((index + 1) / Math.max(1, pages.length)) * 100));
+      onProgress(pageProgress(1));
     }
     return true;
   } finally {
@@ -1143,7 +1161,7 @@ async function runAutoTranslationJob(jobId) {
   try {
     await clearRenderedPages(chapter.id);
     const updateTranslationProgress = (progress) => {
-      db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(95, 5 + Math.round(progress * 0.9)), jobId);
+      db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(75, 3 + Math.round(progress * 0.72)), jobId);
     };
     let results;
     if (config.aiTranslationProvider === 'ollama') {
@@ -1170,6 +1188,11 @@ async function runAutoTranslationJob(jobId) {
     }
     if (isJobCancelled(jobId)) return;
     if (!Array.isArray(results) || results.length !== blocks.length) throw new Error('AI 워커가 모든 OCR 블록의 번역 결과를 반환하지 않았습니다.');
+
+    if (isKoreanTargetLanguage(chapter.target_language || 'ko')
+      && results.some((result) => String(result?.text || '').trim() && !isKoreanText(result.text))) {
+      throw new Error('번역 모델이 한국어가 아닌 문장을 반환해 저장을 중단했습니다. 목표 언어와 모델 설정을 확인해 주세요.');
+    }
 
     const now = new Date().toISOString();
     const translatorId = config.aiTranslationProvider === 'ollama' ? 'ollama' : 'ctranslate2';
@@ -1212,9 +1235,9 @@ async function runAutoTranslationJob(jobId) {
     });
     saveTranslations();
     if (isJobCancelled(jobId)) return;
-    db.prepare('UPDATE jobs SET current_stage = ?, progress = ? WHERE id = ?').run('rendering', 92, jobId);
+    db.prepare('UPDATE jobs SET current_stage = ?, progress = ? WHERE id = ?').run('rendering', 75, jobId);
     const rendered = await renderChapterImages(chapter.id, jobId, (progress) => {
-      db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(99, 92 + Math.round(progress * 0.07)), jobId);
+      db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(99, 75 + Math.round(progress * 0.24)), jobId);
     });
     if (!rendered || isJobCancelled(jobId)) return;
     const finishedAt = new Date().toISOString();
@@ -1365,6 +1388,7 @@ async function runComicTextDetectorWorker(jobId, pages, onProgress) {
           { x: left, y: top }, { x: right, y: top },
           { x: right, y: bottom }, { x: left, y: bottom },
         ],
+        inpaintMask: normalizeInpaintMask(event.maskPolygons),
         sourceText: '',
         confidence: event.confidence == null || !Number.isFinite(Number(event.confidence)) ? null : Number(event.confidence),
         readingOrder: event.candidateIndex,
@@ -1375,6 +1399,16 @@ async function runComicTextDetectorWorker(jobId, pages, onProgress) {
     blocksByPage.set(pageIndex, blocks.filter(Boolean));
   }
   return blocksByPage;
+}
+
+function normalizeInpaintMask(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((polygon) => {
+    if (!Array.isArray(polygon) || polygon.length < 3 || polygon.length > 16) return [];
+    const points = polygon.map((point) => ({ x: Number(point?.x), y: Number(point?.y) }));
+    if (points.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y))) return [];
+    return [points.map((point) => ({ x: Math.min(1, Math.max(0, point.x)), y: Math.min(1, Math.max(0, point.y)) }))];
+  });
 }
 
 async function runLamaInpaintWorker(jobId, pages, onProgress) {
@@ -1677,8 +1711,9 @@ function normalizeConfidence(value) {
 function normalizeLetteringStyle(value) {
   const input = typeof value === 'string' ? parseJson(value, {}) : (value || {});
   const fontSize = Number(input.fontSize);
-  const color = /^#[0-9a-f]{6}$/i.test(String(input.color || '')) ? String(input.color) : '#ffffff';
-  const background = /^rgba?\([0-9.,% ]+\)$/.test(String(input.background || '')) ? String(input.background) : 'rgba(20, 14, 25, 0.72)';
+  const color = /^#[0-9a-f]{6}$/i.test(String(input.color || '')) ? String(input.color) : '#21121a';
+  const savedBackground = /^rgba?\([0-9.,% ]+\)$/.test(String(input.background || '')) ? String(input.background) : 'rgba(255, 255, 255, 0)';
+  const background = savedBackground === 'rgba(255, 255, 255, 0.92)' ? 'rgba(255, 255, 255, 0)' : savedBackground;
   return {
     fontSize: Number.isFinite(fontSize) ? Math.min(96, Math.max(8, fontSize)) : 24,
     color,

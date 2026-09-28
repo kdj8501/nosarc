@@ -1,13 +1,14 @@
 const KOREAN_LANGUAGE = /^(?:ko|kor)(?:[-_]|$)/i;
 const HANGUL = /[\uac00-\ud7af]/g;
+const HAS_HANGUL = /[\uac00-\ud7af]/;
 
 export function autoLetteringStyle(block, translatedText = '', targetLanguage = '') {
   const polygon = parsePolygon(block?.polygon_json);
   const points = polygon.filter((point) => Number.isFinite(Number(point?.x)) && Number.isFinite(Number(point?.y)));
   const language = String(targetLanguage || '').trim();
-  const korean = KOREAN_LANGUAGE.test(language) || HANGUL.test(String(translatedText));
-  HANGUL.lastIndex = 0;
-  const hangulCount = (String(translatedText).match(HANGUL) || []).length;
+  const text = String(translatedText || '').trim();
+  const korean = KOREAN_LANGUAGE.test(language) || HAS_HANGUL.test(text);
+  const hangulCount = (text.match(HANGUL) || []).length;
 
   let width = 0;
   let height = 0;
@@ -27,10 +28,24 @@ export function autoLetteringStyle(block, translatedText = '', targetLanguage = 
 
   return {
     color: '#21121a',
-    background: 'rgba(255, 255, 255, 0.92)',
+    background: 'rgba(255, 255, 255, 0)',
     writingMode,
-    fontSize: writingMode === 'vertical-rl' ? 22 : 20,
+    fontSize: estimateFontSize(block, text, width, height),
   };
+}
+
+function estimateFontSize(block, text, boxWidthRatio, boxHeightRatio) {
+  if (!(boxWidthRatio > 0) || !(boxHeightRatio > 0)) return 20;
+  const pageWidth = Number(block?.width);
+  const pageHeight = Number(block?.height);
+  const referenceWidth = pageWidth > 0 ? Math.min(760, pageWidth) : 760;
+  const width = Math.max(1, boxWidthRatio * referenceWidth);
+  const height = Math.max(1, boxHeightRatio * (pageWidth > 0 && pageHeight > 0
+    ? pageHeight * referenceWidth / pageWidth
+    : referenceWidth));
+  const glyphCount = Math.max(1, Array.from(text).filter((character) => !/\s/u.test(character)).length);
+  const areaPerGlyph = width * height / glyphCount;
+  return Math.round(Math.min(28, Math.max(13, Math.sqrt(areaPerGlyph) * 0.72)));
 }
 
 function parsePolygon(value) {
