@@ -672,6 +672,17 @@ function normalizeLayoutHint(value) {
 
 function getLetteringBox(block) {
   let polygon = block?.polygon_json ?? block?.polygon;
+  let layout = block?.layoutHint ?? block?.layout_hint_json;
+  if (typeof layout === 'string') {
+    try {
+      layout = JSON.parse(layout);
+    } catch {
+      layout = {};
+    }
+  }
+  if (Array.isArray(layout?.letteringPolygon) && layout.letteringPolygon.length >= 3) {
+    polygon = layout.letteringPolygon;
+  }
   if (typeof polygon === 'string') {
     try {
       polygon = JSON.parse(polygon);

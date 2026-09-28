@@ -83,7 +83,7 @@ function getInpaintPolygons(layer) {
   const value = layer.inpaint_mask_json || layer.inpaintMask;
   const parsed = typeof value === 'string' ? parseJson(value, []) : value;
   if (Array.isArray(parsed) && parsed.length && Array.isArray(parsed[0])) return parsed;
-  const polygon = layer.polygon_json || layer.polygon;
+  const polygon = layer.source_polygon_json || layer.polygon_json || layer.polygon;
   const fallback = typeof polygon === 'string' ? parseJson(polygon, []) : polygon;
   return Array.isArray(fallback) ? [fallback] : [];
 }

@@ -76,9 +76,11 @@ class ComicTextDetector:
             if x2 - x1 < 4 or y2 - y1 < 4:
                 continue
             mask_polygons = _text_ink_polygons(mask, block.lines, width, height)
+            lettering_polygon = _estimate_speech_balloon_box(image, (x1, y1, x2, y2))
             results.append({
                 "bbox": [x1 / width, y1 / height, x2 / width, y2 / height],
                 "maskPolygons": mask_polygons,
+                "letteringPolygon": lettering_polygon,
                 "confidence": None,
                 "vertical": bool(block.vertical),
                 "rotation": float(block.angle),
@@ -137,6 +139,86 @@ class ComicTextDetector:
         selected = np.asarray(selected, dtype=np.int64)
         selected = selected[np.argsort(scores[selected])[::-1][:300]]
         return boxes[selected], classes[selected], scores[selected]
+
+
+def _estimate_speech_balloon_box(
+    image: np.ndarray,
+    text_box: tuple[int, int, int, int],
+) -> list[dict[str, float]] | None:
+    """Find a conservative white balloon interior around a detected text block.
+
+    This is intentionally a high-confidence heuristic: only fully enclosed, bright
+    regions clearly larger than the text box are returned. Text-only regions such
+    as sound effects and uncertain balloons fall back to their OCR text bounds.
+    """
+    height, width = image.shape[:2]
+    left, top, right, bottom = text_box
+    text_width = max(1, right - left)
+    text_height = max(1, bottom - top)
+    pad_x = max(24, int(text_width * 2.0))
+    pad_y = max(24, int(text_height * 1.15))
+    crop_left = max(0, left - pad_x)
+    crop_top = max(0, top - pad_y)
+    crop_right = min(width, right + pad_x)
+    crop_bottom = min(height, bottom + pad_y)
+    crop_width = crop_right - crop_left
+    crop_height = crop_bottom - crop_top
+    if crop_width <= 0 or crop_height <= 0 or crop_width * crop_height > width * height * 0.35:
+        return None
+
+    gray = cv2.cvtColor(image[crop_top:crop_bottom, crop_left:crop_right], cv2.COLOR_BGR2GRAY)
+    _, white = cv2.threshold(gray, 238, 255, cv2.THRESH_BINARY)
+    local_left = max(0, left - crop_left)
+    local_top = max(0, top - crop_top)
+    local_right = min(crop_width, right - crop_left)
+    local_bottom = min(crop_height, bottom - crop_top)
+    if local_right <= local_left or local_bottom <= local_top:
+        return None
+    # Remove the detected lettering from the flood-fill input. This lets the
+    # balloon's white interior remain a connected component around the glyphs.
+    white[local_top:local_bottom, local_left:local_right] = 255
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=8)
+    center_x = min(crop_width - 1, max(0, (local_left + local_right) // 2))
+    center_y = min(crop_height - 1, max(0, (local_top + local_bottom) // 2))
+    label = int(labels[center_y, center_x])
+    if label <= 0 or label >= count:
+        return None
+    component_left, component_top, component_width, component_height, area = map(int, stats[label])
+    component_right = component_left + component_width
+    component_bottom = component_top + component_height
+
+    # A region that leaks to the search crop edge is probably page background.
+    edge_gap = min(component_left, component_top, crop_width - component_right, crop_height - component_bottom)
+    if edge_gap <= 1 or area > crop_width * crop_height * 0.78:
+        return None
+    text_area = text_width * text_height
+    if area < text_area * 1.25 or component_width < text_width * 1.12 or component_height < text_height * 1.08:
+        return None
+
+    # Leave a generous inset so the auto layout stays inside the balloon outline.
+    inset_x = max(3, int(component_width * 0.12))
+    inset_y = max(3, int(component_height * 0.12))
+    box_left = crop_left + component_left + inset_x
+    box_top = crop_top + component_top + inset_y
+    box_right = crop_left + component_right - inset_x
+    box_bottom = crop_top + component_bottom - inset_y
+    if (
+        box_left > left
+        or box_top > top
+        or box_right < right
+        or box_bottom < bottom
+        or box_right - box_left < text_width
+        or box_bottom - box_top < text_height
+    ):
+        return None
+
+    return [
+        {"x": float(box_left / width), "y": float(box_top / height)},
+        {"x": float(box_right / width), "y": float(box_top / height)},
+        {"x": float(box_right / width), "y": float(box_bottom / height)},
+        {"x": float(box_left / width), "y": float(box_bottom / height)},
+    ]
 
 
 def _text_ink_polygons(mask: np.ndarray, lines: list, width: int, height: int) -> list[list[dict[str, float]]]:

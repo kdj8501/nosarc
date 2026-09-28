@@ -545,16 +545,21 @@ app.patch('/api/ocr-blocks/:id', async (req, res) => {
   }
   const sourceText = String(req.body?.sourceText ?? current.source_text).trim();
   if (!sourceText) return res.status(400).json({ error: 'OCR 원문을 입력해 주세요.' });
+  const layoutHint = parseJson(current.layout_hint_json, {});
+  if (req.body?.polygon !== undefined) delete layoutHint.letteringPolygon;
   const now = new Date().toISOString();
-  db.prepare(`UPDATE ocr_blocks SET polygon_json = ?, source_text = ?, confidence = ?, reading_order = ?, updated_at = ? WHERE id = ?`).run(
+  db.prepare(`UPDATE ocr_blocks SET polygon_json = ?, layout_hint_json = ?, source_text = ?, confidence = ?, reading_order = ?, updated_at = ? WHERE id = ?`).run(
     JSON.stringify(polygon),
+    JSON.stringify(layoutHint),
     sourceText,
     normalizeConfidence(req.body?.confidence ?? current.confidence),
     Number.isInteger(req.body?.readingOrder) ? req.body.readingOrder : current.reading_order,
     now,
     req.params.id,
   );
-  db.prepare(`UPDATE lettering_layers SET polygon_json = ?, updated_at = ? WHERE translation_id IN (SELECT id FROM translations WHERE ocr_block_id = ? AND is_active = 1)`).run(JSON.stringify(polygon), now, req.params.id);
+  if (req.body?.polygon !== undefined) {
+    db.prepare(`UPDATE lettering_layers SET polygon_json = ?, updated_at = ? WHERE translation_id IN (SELECT id FROM translations WHERE ocr_block_id = ? AND is_active = 1)`).run(JSON.stringify(polygon), now, req.params.id);
+  }
   await clearRenderedPage(current.page_id);
   res.json(getOcrBlock(req.params.id));
 });
@@ -588,7 +593,7 @@ app.post('/api/ocr-blocks/:id/translations', async (req, res) => {
       now,
     );
     db.prepare(`INSERT INTO lettering_layers (id, page_id, translation_id, polygon_json, text, style_json, is_active, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(layerId, block.page_id, translationId, block.polygon_json, translatedText, JSON.stringify(style), now, now);
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(layerId, block.page_id, translationId, JSON.stringify(getAutomaticLetteringPolygon(block)), translatedText, JSON.stringify(style), now, now);
   });
   create();
   await clearRenderedPage(block.page_id);
@@ -1047,7 +1052,7 @@ async function runRenderJob(jobId) {
 async function renderChapterImages(chapterId, jobId = null, onProgress = () => {}) {
   const pages = db.prepare(`SELECT p.*, a.storage_key, a.original_name, a.mime_type
     FROM pages p JOIN assets a ON a.id = p.image_asset_id WHERE p.chapter_id = ? ORDER BY p.page_index`).all(chapterId);
-  const layers = db.prepare(`SELECT l.*, b.inpaint_mask_json FROM lettering_layers l JOIN pages p ON p.id = l.page_id
+  const layers = db.prepare(`SELECT l.*, b.inpaint_mask_json, b.polygon_json AS source_polygon_json FROM lettering_layers l JOIN pages p ON p.id = l.page_id
     LEFT JOIN translations t ON t.id = l.translation_id
     LEFT JOIN ocr_blocks b ON b.id = t.ocr_block_id
     WHERE p.chapter_id = ? AND l.is_active = 1 AND TRIM(l.text) <> '' ORDER BY l.created_at`).all(chapterId);
@@ -1233,7 +1238,7 @@ async function runAutoTranslationJob(jobId) {
           layerId,
           block.page_id,
           translationId,
-          block.polygon_json,
+          JSON.stringify(getAutomaticLetteringPolygon(block)),
           translatedText,
           JSON.stringify(autoLetteringStyle(block, translatedText, chapter.target_language || 'ko', result.kind)),
           now,
@@ -1402,6 +1407,7 @@ async function runComicTextDetectorWorker(jobId, pages, onProgress) {
           rotation: Number.isFinite(Number(event.rotation)) ? Math.min(45, Math.max(-45, Number(event.rotation))) : 0,
           textLineCount: Number.isFinite(Number(event.textLineCount)) ? Math.max(1, Math.round(Number(event.textLineCount))) : 1,
           foregroundColor: /^#[0-9a-f]{6}$/i.test(String(event.foregroundColor || '')) ? String(event.foregroundColor) : '#21121a',
+          letteringPolygon: normalizeOptionalPolygon(event.letteringPolygon),
         },
         sourceText: '',
         confidence: event.confidence == null || !Number.isFinite(Number(event.confidence)) ? null : Number(event.confidence),
@@ -1410,9 +1416,48 @@ async function runComicTextDetectorWorker(jobId, pages, onProgress) {
     }
   });
   for (const [pageIndex, blocks] of blocksByPage) {
-    blocksByPage.set(pageIndex, blocks.filter(Boolean));
+    const pageBlocks = blocks.filter(Boolean);
+    suppressSharedLetteringRegions(pageBlocks);
+    blocksByPage.set(pageIndex, pageBlocks);
   }
   return blocksByPage;
+}
+
+function suppressSharedLetteringRegions(blocks) {
+  const candidates = blocks
+    .map((block, index) => ({ index, bounds: getNormalizedPolygonBounds(block.layoutHint?.letteringPolygon) }))
+    .filter((candidate) => candidate.bounds);
+  const ambiguous = new Set();
+  for (let first = 0; first < candidates.length; first += 1) {
+    for (let second = first + 1; second < candidates.length; second += 1) {
+      const left = candidates[first];
+      const right = candidates[second];
+      const intersectionWidth = Math.max(0, Math.min(left.bounds.right, right.bounds.right) - Math.max(left.bounds.left, right.bounds.left));
+      const intersectionHeight = Math.max(0, Math.min(left.bounds.bottom, right.bounds.bottom) - Math.max(left.bounds.top, right.bounds.top));
+      const intersection = intersectionWidth * intersectionHeight;
+      const smallerArea = Math.min(left.bounds.area, right.bounds.area);
+      if (smallerArea > 0 && intersection / smallerArea >= 0.78) {
+        ambiguous.add(left.index);
+        ambiguous.add(right.index);
+      }
+    }
+  }
+  for (const index of ambiguous) blocks[index].layoutHint.letteringPolygon = null;
+}
+
+function getNormalizedPolygonBounds(polygon) {
+  if (!Array.isArray(polygon) || polygon.length < 3) return null;
+  const points = polygon
+    .map((point) => ({ x: Number(point?.x), y: Number(point?.y) }))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  if (points.length < 3) return null;
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const left = Math.min(...xs);
+  const top = Math.min(...ys);
+  const right = Math.max(...xs);
+  const bottom = Math.max(...ys);
+  return { left, top, right, bottom, area: Math.max(0, right - left) * Math.max(0, bottom - top) };
 }
 
 function normalizeInpaintMask(value) {
@@ -1423,6 +1468,21 @@ function normalizeInpaintMask(value) {
     if (points.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y))) return [];
     return [points.map((point) => ({ x: Math.min(1, Math.max(0, point.x)), y: Math.min(1, Math.max(0, point.y)) }))];
   });
+}
+
+function normalizeOptionalPolygon(value) {
+  if (!Array.isArray(value) || value.length < 3 || value.length > 16) return null;
+  try {
+    return normalizePolygon(value);
+  } catch {
+    return null;
+  }
+}
+
+function getAutomaticLetteringPolygon(block) {
+  const layoutHint = parseJson(block?.layout_hint_json, {});
+  return normalizeOptionalPolygon(layoutHint.letteringPolygon)
+    || parseJson(block?.polygon_json, []);
 }
 
 async function runLamaInpaintWorker(jobId, pages, onProgress) {

@@ -13,14 +13,12 @@ export function autoLetteringStyle(block, translatedText = '', targetLanguage = 
   const soundEffect = contentKind === 'sound_effect'
     || (contentKind !== 'dialogue' && contentKind !== 'caption' && looksLikeJapaneseSoundEffect(block?.source_text));
 
-  let width = 0;
-  let height = 0;
-  if (points.length) {
-    const xs = points.map((point) => Number(point.x));
-    const ys = points.map((point) => Number(point.y));
-    width = Math.max(...xs) - Math.min(...xs);
-    height = Math.max(...ys) - Math.min(...ys);
-  }
+  const sourceBox = polygonDimensions(points);
+  const balloonPoints = parsePolygon(layout.letteringPolygon)
+    .filter((point) => Number.isFinite(Number(point?.x)) && Number.isFinite(Number(point?.y)));
+  const fitBox = !soundEffect && balloonPoints.length >= 3 ? polygonDimensions(balloonPoints) : sourceBox;
+  const width = sourceBox.width;
+  const height = sourceBox.height;
 
   // Use horizontal Korean for ordinary text, while preserving vertical flow for
   // very short captions and vertically designed sound effects.
@@ -39,11 +37,21 @@ export function autoLetteringStyle(block, translatedText = '', targetLanguage = 
     outlineColor: soundEffect ? contrastingOutline(color) : '',
     background: 'rgba(255, 255, 255, 0)',
     writingMode,
-    fontSize: Math.round(Math.min(32, estimateFontSize(block, text, width, height) * (soundEffect ? 1.12 : 1))),
+    fontSize: Math.round(Math.min(32, estimateFontSize(block, text, fitBox.width, fitBox.height) * (soundEffect ? 1.12 : 1))),
     fontWeight: soundEffect ? '700' : '600',
     outlineWidth: soundEffect ? 2.6 : 1.2,
     rotation: soundEffect && Number.isFinite(sourceRotation) ? Math.min(45, Math.max(-45, sourceRotation)) : 0,
     soundEffect,
+  };
+}
+
+function polygonDimensions(points) {
+  if (!points.length) return { width: 0, height: 0 };
+  const xs = points.map((point) => Number(point.x));
+  const ys = points.map((point) => Number(point.y));
+  return {
+    width: Math.max(...xs) - Math.min(...xs),
+    height: Math.max(...ys) - Math.min(...ys),
   };
 }
 
