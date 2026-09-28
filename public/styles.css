@@ -113,9 +113,10 @@ dialog::backdrop { background: #08070cb8; backdrop-filter: blur(3px); }
 .translation-controls .muted { font-size: 12px; }
 .reader-stage { flex: 1; min-height: 0; overflow: auto; padding: 0 4px 25px; background: #0c0b10; border-radius: 12px; }
 .reader-page { width: min(100%, 760px); margin: 0 auto 18px; }
-.reader-canvas { position: relative; }
+.reader-canvas { position: relative; container-type: inline-size; }
 .reader-page img { display: block; width: 100%; height: auto; background: #17151d; }
-.lettering-layer { position: absolute; display: flex; align-items: center; justify-content: center; overflow: hidden; padding: 5px 7px; line-height: 1.1; white-space: pre-wrap; overflow-wrap: anywhere; text-shadow: 0 0 1px rgba(255, 255, 255, 0.92), 0 0 2px rgba(255, 255, 255, 0.72); }
+.lettering-layer { position: absolute; display: flex; align-items: center; justify-content: center; overflow: hidden; padding: .66cqw .92cqw; line-height: 1.1; white-space: pre-wrap; overflow-wrap: anywhere; text-shadow: 0 0 1px rgba(255, 255, 255, 0.92), 0 0 2px rgba(255, 255, 255, 0.72); }
+.lettering-effect { text-shadow: none; }
 .reader-page figcaption { padding: 7px; color: var(--muted); text-align: center; font-size: 12px; }
 .reader-empty { display: grid; height: 100%; min-height: 220px; place-items: center; color: var(--muted); }
 .processing-dialog { width: min(620px, calc(100% - 28px)); }

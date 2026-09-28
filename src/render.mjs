@@ -3,8 +3,8 @@ import fs from 'node:fs';
 
 const { createCanvas, loadImage, GlobalFonts } = canvas;
 const registeredFonts = new Set();
-const CLOSING_PUNCTUATION = new Set(Array.from('、。，．！？：；）〕］｝〉》」』】〙〗〟’”!?.,:;)]}…'));
-const OPENING_PUNCTUATION = new Set(Array.from('（〔［｛〈《「『【〘〖〝‘“([{'));
+const CLOSING_PUNCTUATION = new Set(Array.from('、。，．！？：；）〕］｝〉》」』】〙〗〟’”!?.,:;)]}"\'…'));
+const OPENING_PUNCTUATION = new Set(Array.from('（〔［｛〈《「『【〘〖〝‘“([{"\''));
 
 export async function renderTranslatedPage(sourcePath, layers, {
   inpaintPadding = 0.008,
@@ -145,6 +145,13 @@ function drawLettering(context, layer, width, height, fontFamily) {
   if (!bounds) return;
   const style = normalizeStyle(layer.style_json || layer.style);
   context.save();
+  if (Math.abs(style.rotation) > 0.1) {
+    const centerX = bounds.left + bounds.width / 2;
+    const centerY = bounds.top + bounds.height / 2;
+    context.translate(centerX, centerY);
+    context.rotate(style.rotation * Math.PI / 180);
+    context.translate(-centerX, -centerY);
+  }
   context.beginPath();
   context.rect(bounds.left, bounds.top, bounds.width, bounds.height);
   context.clip();
@@ -152,9 +159,11 @@ function drawLettering(context, layer, width, height, fontFamily) {
   context.fillRect(bounds.left, bounds.top, bounds.width, bounds.height);
   context.fillStyle = style.color;
   context.textBaseline = 'middle';
-  const baseFontSize = Math.max(8, style.fontSize * Math.max(1, width / 760));
-  if (style.writingMode === 'vertical-rl') drawVerticalText(context, layer.text, bounds, style, fontFamily, baseFontSize);
-  else drawHorizontalText(context, layer.text, bounds, style, fontFamily, baseFontSize);
+  const fontScale = Math.max(1, width / 760);
+  const drawStyle = { ...style, outlineWidth: style.outlineWidth * fontScale };
+  const baseFontSize = Math.max(8, style.fontSize * fontScale);
+  if (drawStyle.writingMode === 'vertical-rl') drawVerticalText(context, layer.text, bounds, drawStyle, fontFamily, baseFontSize);
+  else drawHorizontalText(context, layer.text, bounds, drawStyle, fontFamily, baseFontSize);
   context.restore();
 }
 
@@ -182,7 +191,7 @@ function drawHorizontalText(context, value, bounds, style, fontFamily, baseFontS
       : style.textAlign === 'right'
       ? bounds.right - inset - lineWidth
       : bounds.left + (bounds.width - lineWidth) / 2;
-    drawTextWithOutline(context, line, x, firstY + index * lineHeight, style.color, fontSize);
+    drawTextWithOutline(context, line, x, firstY + index * lineHeight, style.color, fontSize, style);
   }
 }
 
@@ -209,19 +218,21 @@ function drawVerticalText(context, value, bounds, style, fontFamily, baseFontSiz
     const row = index % rows;
     const x = bounds.right - inset - columnWidth * (column + 0.5);
     const y = bounds.top + inset + row * lineHeight;
-    drawTextWithOutline(context, character, x - context.measureText(character).width / 2, y + fontSize / 2, style.color, fontSize);
+    drawTextWithOutline(context, character, x - context.measureText(character).width / 2, y + fontSize / 2, style.color, fontSize, style);
   }
 }
 
-function drawTextWithOutline(context, text, x, y, color, fontSize) {
+function drawTextWithOutline(context, text, x, y, color, fontSize, style = {}) {
   const hex = /^#([0-9a-f]{6})$/i.exec(color)?.[1] || '21121a';
   const red = Number.parseInt(hex.slice(0, 2), 16);
   const green = Number.parseInt(hex.slice(2, 4), 16);
   const blue = Number.parseInt(hex.slice(4, 6), 16);
   const luminance = (red * 299 + green * 587 + blue * 114) / 1000;
   context.lineJoin = 'round';
-  context.lineWidth = Math.max(0.8, Math.min(2, fontSize * 0.07));
-  context.strokeStyle = luminance >= 145 ? 'rgba(25, 18, 27, 0.78)' : 'rgba(255, 255, 255, 0.92)';
+  context.lineWidth = Math.max(0.8, Math.min(6, Number(style.outlineWidth) || Math.min(2, fontSize * 0.07)));
+  context.strokeStyle = style.outlineColor
+    ? hexToRgba(style.outlineColor, style.outlineColor === '#ffffff' ? 0.92 : 0.78)
+    : luminance >= 145 ? 'rgba(25, 18, 27, 0.78)' : 'rgba(255, 255, 255, 0.92)';
   context.strokeText(text, x, y);
   context.fillStyle = color;
   context.fillText(text, x, y);
@@ -231,6 +242,19 @@ function wrapText(context, value, maxWidth) {
   const lines = [];
   for (const originalLine of value.split(/\r?\n/)) {
     let line = '';
+    const pushLine = () => {
+      const trimmedLine = line.trimEnd();
+      const characters = Array.from(trimmedLine);
+      const lastCharacter = characters.at(-1) || '';
+      if (OPENING_PUNCTUATION.has(lastCharacter) && characters.length > 1) {
+        characters.pop();
+        lines.push(characters.join('').trimEnd());
+        line = lastCharacter;
+      } else {
+        lines.push(trimmedLine);
+        line = '';
+      }
+    };
     const appendWord = (word) => {
       for (const character of Array.from(word)) {
         if (line && context.measureText(line + character).width > maxWidth) {
@@ -260,8 +284,7 @@ function wrapText(context, value, maxWidth) {
         continue;
       }
       if (line && context.measureText(line + token).width > maxWidth) {
-        lines.push(line.trimEnd());
-        line = '';
+        pushLine();
       }
       appendWord(token);
     }
@@ -299,6 +322,10 @@ function normalizeStyle(value) {
     writingMode: ['vertical-rl', 'horizontal-tb'].includes(style.writingMode) ? style.writingMode : 'vertical-rl',
     textAlign: ['center', 'left', 'right'].includes(style.textAlign) ? style.textAlign : 'center',
     fontWeight: ['400', '600', '700'].includes(String(style.fontWeight)) ? String(style.fontWeight) : '600',
+    rotation: Number.isFinite(Number(style.rotation)) ? Math.min(45, Math.max(-45, Number(style.rotation))) : 0,
+    outlineWidth: Number.isFinite(Number(style.outlineWidth)) ? Math.min(6, Math.max(0.8, Number(style.outlineWidth))) : 1.4,
+    outlineColor: /^#[0-9a-f]{6}$/i.test(String(style.outlineColor || '')) ? String(style.outlineColor) : '',
+    soundEffect: style.soundEffect === true,
   };
 }
 
@@ -308,6 +335,13 @@ function parseJson(value, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function hexToRgba(value, alpha) {
+  const hex = /^#([0-9a-f]{6})$/i.exec(String(value || ''))?.[1];
+  if (!hex) return `rgba(255, 255, 255, ${alpha})`;
+  const channels = [0, 2, 4].map((offset) => Number.parseInt(hex.slice(offset, offset + 2), 16));
+  return `rgba(${channels[0]}, ${channels[1]}, ${channels[2]}, ${alpha})`;
 }
 
 function registerFont(fontPath, fontFamily) {

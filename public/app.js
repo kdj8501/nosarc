@@ -259,8 +259,12 @@ function renderLetteringLayer(layer) {
   const writingMode = ['vertical-rl', 'horizontal-tb'].includes(style.writingMode) ? style.writingMode : 'vertical-rl';
   const textAlign = ['center', 'left', 'right'].includes(style.textAlign) ? style.textAlign : 'center';
   const fontWeight = ['400', '600', '700'].includes(String(style.fontWeight)) ? style.fontWeight : '600';
-  const css = `left:${bounds.left}%;top:${bounds.top}%;width:${bounds.width}%;height:${bounds.height}%;font-size:${fontSize}px;color:${color};background:${background};writing-mode:${writingMode};text-align:${textAlign};font-weight:${fontWeight};`;
-  return `<div class="lettering-layer" style="${css}">${escapeHtml(layer.text).replaceAll('\n', '<br />')}</div>`;
+  const soundEffect = style.soundEffect === true;
+  const rotation = Number.isFinite(Number(style.rotation)) ? Math.min(45, Math.max(-45, Number(style.rotation))) : 0;
+  const outlineWidth = soundEffect && Number.isFinite(Number(style.outlineWidth)) ? Math.min(6, Math.max(0.8, Number(style.outlineWidth))) : 0;
+  const outlineColor = /^#[0-9a-f]{6}$/i.test(String(style.outlineColor || '')) ? style.outlineColor : '#ffffff';
+  const css = `left:${bounds.left}%;top:${bounds.top}%;width:${bounds.width}%;height:${bounds.height}%;font-size:${fontSize / 7.6}cqw;color:${color};background:${background};writing-mode:${writingMode};text-align:${textAlign};font-weight:${fontWeight};transform:rotate(${rotation}deg);-webkit-text-stroke:${outlineWidth / 7.6}cqw ${outlineColor};paint-order:stroke fill;`;
+  return `<div class="lettering-layer${soundEffect ? ' lettering-effect' : ''}" style="${css}">${escapeHtml(layer.text).replaceAll('\n', '<br />')}</div>`;
 }
 
 function polygonBounds(polygon = []) {

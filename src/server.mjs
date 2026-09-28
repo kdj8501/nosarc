@@ -165,6 +165,7 @@ db.exec(`
     page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
     polygon_json TEXT NOT NULL,
     inpaint_mask_json TEXT,
+    layout_hint_json TEXT,
     source_text TEXT NOT NULL,
     source_language TEXT NOT NULL DEFAULT 'ja',
     confidence REAL,
@@ -219,6 +220,9 @@ if (!pageColumns.some((column) => column.name === 'rendered_asset_id')) {
 const ocrBlockColumns = db.prepare('PRAGMA table_info(ocr_blocks)').all();
 if (!ocrBlockColumns.some((column) => column.name === 'inpaint_mask_json')) {
   db.exec('ALTER TABLE ocr_blocks ADD COLUMN inpaint_mask_json TEXT');
+}
+if (!db.prepare('PRAGMA table_info(ocr_blocks)').all().some((column) => column.name === 'layout_hint_json')) {
+  db.exec('ALTER TABLE ocr_blocks ADD COLUMN layout_hint_json TEXT');
 }
 
 const sessions = new Map();
@@ -817,7 +821,11 @@ function getLetteringLayer(id) {
 }
 
 function serializeOcrBlock(block) {
-  return { ...block, polygon: parseJson(block.polygon_json, []) };
+  return {
+    ...block,
+    polygon: parseJson(block.polygon_json, []),
+    layoutHint: parseJson(block.layout_hint_json, {}),
+  };
 }
 
 function serializeTranslation(translation) {
@@ -934,9 +942,9 @@ function insertOcrBlocks(page, blocks, recognized, modelId, modelVersion) {
     for (const [index, block] of blocks.entries()) {
       const key = `${page.page_index}:${index}`;
       const sourceText = recognized.get(key) || block.sourceText;
-      db.prepare(`INSERT INTO ocr_blocks (id, page_id, polygon_json, inpaint_mask_json, source_text, source_language, confidence, reading_order, model_id, model_version, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-        crypto.randomUUID(), page.id, JSON.stringify(block.polygon), JSON.stringify(block.inpaintMask || []), sourceText, config.ocrLanguage,
+      db.prepare(`INSERT INTO ocr_blocks (id, page_id, polygon_json, inpaint_mask_json, layout_hint_json, source_text, source_language, confidence, reading_order, model_id, model_version, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        crypto.randomUUID(), page.id, JSON.stringify(block.polygon), JSON.stringify(block.inpaintMask || []), JSON.stringify(block.layoutHint || {}), sourceText, config.ocrLanguage,
         block.confidence, block.readingOrder, modelId, modelVersion, now, now,
       );
     }
@@ -1227,7 +1235,7 @@ async function runAutoTranslationJob(jobId) {
           translationId,
           block.polygon_json,
           translatedText,
-          JSON.stringify(autoLetteringStyle(block, translatedText, chapter.target_language || 'ko')),
+          JSON.stringify(autoLetteringStyle(block, translatedText, chapter.target_language || 'ko', result.kind)),
           now,
           now,
         );
@@ -1389,6 +1397,12 @@ async function runComicTextDetectorWorker(jobId, pages, onProgress) {
           { x: right, y: bottom }, { x: left, y: bottom },
         ],
         inpaintMask: normalizeInpaintMask(event.maskPolygons),
+        layoutHint: {
+          vertical: event.vertical === true,
+          rotation: Number.isFinite(Number(event.rotation)) ? Math.min(45, Math.max(-45, Number(event.rotation))) : 0,
+          textLineCount: Number.isFinite(Number(event.textLineCount)) ? Math.max(1, Math.round(Number(event.textLineCount))) : 1,
+          foregroundColor: /^#[0-9a-f]{6}$/i.test(String(event.foregroundColor || '')) ? String(event.foregroundColor) : '#21121a',
+        },
         sourceText: '',
         confidence: event.confidence == null || !Number.isFinite(Number(event.confidence)) ? null : Number(event.confidence),
         readingOrder: event.candidateIndex,
