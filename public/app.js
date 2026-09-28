@@ -20,6 +20,10 @@ async function boot() {
   $('#new-series').addEventListener('click', () => $('#series-dialog').showModal());
   $('#series-form').addEventListener('submit', createSeries);
   $('#chapter-form').addEventListener('submit', uploadChapter);
+  document.querySelectorAll('[data-dialog-cancel]').forEach((button) => button.addEventListener('click', () => button.closest('dialog')?.close('cancel')));
+  $('#series-dialog').addEventListener('close', () => $('#series-form').reset());
+  $('#chapter-dialog').addEventListener('close', () => $('#chapter-form').reset());
+  $('#chapter-dialog').addEventListener('cancel', () => $('#chapter-form').reset());
   $('#series-detail-close').addEventListener('click', () => $('#series-detail-dialog').close());
   $('#series-delete').addEventListener('click', () => state.detailSeriesId && deleteSeries(state.detailSeriesId, $('#series-detail-title').textContent));
   $('#reader-close').addEventListener('click', () => $('#reader-dialog').close());
@@ -72,6 +76,7 @@ function renderSeries(item) {
 }
 
 function openChapter(id, title) {
+  $('#chapter-form').reset();
   $('#chapter-series-id').value = id;
   $('#chapter-dialog-title').textContent = `${title} · 권 업로드`;
   $('#chapter-dialog').showModal();
@@ -93,6 +98,7 @@ async function openSeries(id) {
   document.querySelectorAll('[data-cancel]').forEach((button) => button.addEventListener('click', () => cancelJob(button.dataset.cancel)));
   document.querySelectorAll('[data-delete-chapter]').forEach((button) => button.addEventListener('click', () => deleteChapter(button.dataset.deleteChapter, button.dataset.title)));
   document.querySelectorAll('[data-ocr]').forEach((button) => button.addEventListener('click', () => startOcr(button.dataset.ocr)));
+  document.querySelectorAll('[data-reprocess-ocr]').forEach((button) => button.addEventListener('click', () => startOcr(button.dataset.reprocessOcr, { replaceExisting: true })));
   document.querySelectorAll('[data-auto-translate]').forEach((button) => button.addEventListener('click', () => startAutoTranslate(button.dataset.autoTranslate)));
   series.chapters.filter((chapter) => ['queued', 'running'].includes(chapter.job_status)).forEach((chapter) => watchJob(chapter.job_id));
 }
@@ -120,11 +126,14 @@ function renderChapter(chapter) {
         : '';
   const fallbackAction = !active && !failed && readable && !chapter.ocr_block_count
     ? `<button class="button small ghost" data-ocr="${chapter.id}">다시 분석</button>`
-    : !active && !failed && readable && chapter.ocr_block_count && !chapter.translation_count && chapter.job_type !== 'auto_translate'
-      ? `<button class="button small ghost" data-auto-translate="${chapter.id}">자동 역식</button>`
+    : !active && !failed && readable && chapter.ocr_block_count
+      ? `<button class="button small ghost" data-auto-translate="${chapter.id}">${chapter.translation_count ? '번역 다시 실행' : '자동 역식'}</button>`
       : '';
+  const reprocessAction = !active && !failed && readable && chapter.ocr_block_count
+    ? `<button class="button small ghost" data-reprocess-ocr="${chapter.id}">\uC5ED\uC2DD \uB2E4\uC2DC \uC2E4\uD589</button>`
+    : '';
   const deleteAction = `<button class="button small danger" data-delete-chapter="${chapter.id}" data-title="${escapeHtml(`${chapter.number_label}${chapter.title ? ` · ${chapter.title}` : ''}`)}">삭제</button>`;
-  return `<article class="chapter-row"><div class="chapter-info"><strong>${escapeHtml(chapter.number_label)}${chapter.title ? ` · ${escapeHtml(chapter.title)}` : ''}</strong><span class="muted">${escapeHtml(status)}${chapter.ocr_block_count ? ` · OCR ${chapter.ocr_block_count}개${chapter.translation_count ? ` · 번역 ${chapter.translation_count}개` : ''}` : ''}</span>${progressMarkup}</div><div class="chapter-actions">${readAction}${processAction}${fallbackAction}${deleteAction}</div></article>`;
+  return `<article class="chapter-row"><div class="chapter-info"><strong>${escapeHtml(chapter.number_label)}${chapter.title ? ` · ${escapeHtml(chapter.title)}` : ''}</strong><span class="muted">${escapeHtml(status)}${chapter.ocr_block_count ? ` · OCR ${chapter.ocr_block_count}개${chapter.translation_count ? ` · 번역 ${chapter.translation_count}개` : ''}` : ''}</span>${progressMarkup}</div><div class="chapter-actions">${readAction}${processAction}${fallbackAction}${reprocessAction}${deleteAction}</div></article>`;
 }
 
 function processingStatusLabel(status) {
@@ -179,7 +188,8 @@ async function deleteSeries(seriesId, title = '이 작품') {
   await loadSeries($('#search').value);
 }
 
-async function startOcr(chapterId) {
+async function startOcr(chapterId, { replaceExisting = false } = {}) {
+  if (replaceExisting && !window.confirm('새 OCR 결과로 기존 OCR 문장, 번역 및 식자 레이어를 교체합니다. 다시 실행할까요?')) return;
   const result = await request(`/api/chapters/${chapterId}/ocr`, { method: 'POST' });
   if (!result?.id) return;
   showNotice('OCR 작업을 접수했습니다.');

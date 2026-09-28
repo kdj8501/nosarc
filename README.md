@@ -13,7 +13,7 @@
 - PDF 페이지 렌더링과 CBZ/ZIP 이미지 추출
 - 단일 작업 큐, 진행률, 실패·취소·재시도 상태
 - OCR 블록·번역문·식자 레이어 저장 API와 리더 오버레이
-- Tesseract.js 검출 + Manga OCR 재인식 기반 일본어 OCR 작업과 진행 상태
+- 만화 전용 Comic Text Detector 검출 + Manga OCR 재인식 기반 일본어 OCR 작업과 진행 상태
 - 리더 안에서 OCR 블록별 번역문과 기본 식자 스타일 편집
 - 로컬 CTranslate2 기반 자동 번역·식자 작업 큐
 - CPU 기반 LaMa 원문 영역 제거·배경 복원·번역 이미지 렌더링
@@ -21,25 +21,36 @@
 - 원본 파일과 페이지 파일을 보호된 `/media/:id`로 제공
 - 첫 번째 라이브러리 화면과 업로드 폼
 
-현재 OCR 기본값은 Tesseract.js로 말풍선 후보 영역을 검출한 뒤 Manga OCR로 영역을 재인식하는 하이브리드 방식(`OCR_PROVIDER=manga-ocr`)입니다. N100 같은 CPU 환경에서는 검출과 인식을 분리해 불필요한 전체 페이지 추론을 줄입니다. `OCR_PROVIDER=tesseract`로 바꾸면 Tesseract 결과만 사용하는 대체 경로로 동작합니다. Manga OCR 모델은 첫 실행 시 `OCR_MANGA_CACHE_PATH`에 내려받아 재사용합니다.
+현재 OCR 기본값(`OCR_PROVIDER=manga-ocr`)은 만화 전용 Comic Text Detector로 페이지에서 글 영역을 찾고, 각 영역을 Manga OCR로 읽습니다. Tesseract 희소 검출과 근접 영역 병합은 더 이상 기본 경로에 사용하지 않습니다. `OCR_PROVIDER=tesseract`로 설정하면 기존 Tesseract OCR만 사용하는 대체 경로로 동작합니다.
 
 리더에서 `번역 편집`을 누르면 OCR 블록별 번역문을 입력하고 세로쓰기/가로쓰기와 글자 크기를 저장할 수 있습니다. 저장된 결과는 번역 모드의 식자 레이어로 표시됩니다. 역식 데이터 API는 `POST /api/pages/:id/ocr-blocks`, `POST /api/ocr-blocks/:id/translations`, `PATCH /api/lettering-layers/:id`이며, 좌표는 페이지 기준 0~1 정규화 좌표를 사용합니다.
 
-권을 업로드하면 페이지 준비 → OCR → 로컬 자동 번역·식자 작업이 순서대로 백그라운드에서 실행됩니다. 화면의 처리 패널에서 단계와 진행률을 확인할 수 있으며, 자동 역식이 끝나면 번역된 만화 리더를 바로 엽니다. 번역이 끝나면 OCR 영역 마스크를 LaMa 딥러닝 모델에 전달해 원문을 제거·복원하고, 번역문을 페이지 이미지에 직접 렌더링합니다. 리더의 `이미지 다시 렌더링` 버튼으로 수동 번역 수정 결과도 다시 이미지화할 수 있습니다. LaMa 모델이 없거나 실행에 실패하면 기존 주변 픽셀 보간 방식으로 자동 대체합니다.
+권을 업로드하면 페이지 준비 → OCR → 로컬 자동 번역·식자 작업이 순서대로 백그라운드에서 실행됩니다. 화면의 처리 패널에서 단계와 진행률을 확인할 수 있으며, 자동 역식이 끝나면 번역된 만화 리더를 바로 엽니다. 번역은 블록별 CTranslate2/NLLB 추론을 사용하고 기본 빔 크기는 4입니다. 한국어 자동 식자는 가로쓰기를 우선하고, 매우 좁은 상자 안의 짧은 문구만 세로쓰기를 유지합니다. 렌더러는 번역문을 OCR 상자 안에서 자동 축소·단어 단위 줄바꿈하고 상자 밖으로 넘치지 않게 자릅니다. LaMa 모델이 없으면 4방향 주변 픽셀을 이용한 CPU 보간으로 원문 영역을 채웁니다. 이 보간은 만화 전용 인페인팅 모델의 복원 품질과 같지 않습니다.
+
+## OCR 모델 준비
+
+`OCR_PROVIDER=manga-ocr`는 만화 전용 Comic Text Detector로 글 영역을 찾은 다음, 각 영역을 Manga OCR로 읽습니다. 영역 검출과 인식은 로컬 CPU에서 실행합니다. 첫 설치 후 `npm run setup:ai`를 실행하면 CPU용 Python 라이브러리, 약 95MB 검출 모델, Manga OCR 인식 모델을 준비합니다. 최초 모델 설치에는 인터넷 연결이 필요합니다.
+
+이미 등록한 권은 작품 목록의 `역식 다시 실행` 버튼으로 새 OCR·번역 파이프라인을 적용할 수 있습니다. 확인 후 새 OCR을 성공적으로 마치면 이전 OCR 문장과 번역·식자 레이어를 교체합니다. OCR에 실패하면 기존 결과를 유지합니다.
+
+`ai-worker/vendor/comic-text-detector`에는 [Comic Text Detector](https://github.com/dmMaze/comic-text-detector) 추론 코드와 GPL-3.0 라이선스가 포함돼 있습니다. 모델은 [manga-image-translator beta 0.2.1 릴리스](https://github.com/zyddnys/manga-image-translator/releases/tag/beta-0.2.1)에서 내려받습니다. 별도의 추론 어댑터가 학습용 의존성 없이 ONNX CPU 모델을 실행합니다. 다른 OCR 경로가 필요하면 `.env`에서 `OCR_PROVIDER=tesseract`를 선택할 수 있습니다.
 
 ## 실행
 
 Node.js 20 이상이 필요합니다.
 
 ```powershell
-npm install
+npm.cmd install
 Copy-Item .env.example .env
-npm start
+npm.cmd run setup:ai
+npm.cmd start
 ```
+
+PowerShell에서 `npm.ps1` 실행 정책 오류가 나면 위처럼 `npm.cmd`를 사용하세요. `NODE_MODULE_VERSION` 불일치가 나오면 설치와 실행에 같은 Node 버전을 사용해야 합니다. 이 작업공간에 Node 22 실행기가 준비돼 있으면 `\.tools\nosarc-npm.cmd`로 npm 명령을 실행하세요. 실행 정책을 바꾸지 않아도 됩니다.
 
 브라우저에서 `http://localhost:3000`을 열고 개발 환경 기본 비밀번호 `change-this-password`로 로그인합니다. 실제 사용 전에는 `.env`의 `NOSARC_ACCESS_PASSWORD`를 바꾸거나 `NOSARC_ACCESS_PASSWORD_HASH`에 Argon2id 해시를 설정하세요.
 
-첫 OCR 실행 시 `jpn.traineddata`를 `data/tesseract/`에 내려받으며, 이 디렉터리는 Git에서 무시됩니다. 네트워크가 차단된 환경에서는 `OCR_LANG_PATH`로 미리 받은 언어 데이터를 지정하세요.
+`OCR_PROVIDER=tesseract` 대체 경로를 쓸 때는 `jpn.traineddata`가 필요합니다. 첫 실행 때 `data/tesseract/`에 내려받으며, 네트워크가 차단된 환경에서는 `OCR_LANG_PATH`로 미리 받은 언어 데이터를 지정하세요.
 
 자동 번역 워커는 Python 3.11 이상과 로컬 CTranslate2 모델이 필요합니다. 번역은 기본 8개 블록씩 나눠 처리해 진행률을 갱신하며, N100·16GB 환경에서는 워커를 한 개만 실행하고 INT8 모델을 사용하도록 기본값을 둡니다. 배치 크기는 `.env`의 `AI_TRANSLATION_BATCH_SIZE`로 조정할 수 있습니다.
 
@@ -49,11 +60,13 @@ py -3.11 -m venv ai-worker/.venv
 & .\ai-worker\.venv\Scripts\python.exe -m pip install -r ai-worker/requirements-cpu.txt
 ```
 
-`requirements-cpu.txt`는 CUDA를 설치하지 않고 CPU 전용 PyTorch와 ONNX Runtime을 사용합니다. 모델 변환기, Manga OCR, LaMa ONNX 실행을 위해 필요한 CPU 라이브러리를 함께 설치합니다. Manga OCR 모델은 첫 OCR 실행 시 Hugging Face 캐시(`data/models/huggingface`)에 내려받고, LaMa ONNX 모델은 `data/models/lama/`에 준비합니다.
+`requirements-cpu.txt`는 CUDA를 설치하지 않고 CPU 전용 PyTorch와 ONNX Runtime을 사용합니다. Comic Text Detector, Manga OCR, LaMa ONNX 실행에 필요한 라이브러리를 함께 설치합니다. LaMa ONNX 모델은 `data/models/lama/`에 별도로 준비합니다.
 
 Windows에서는 기본적으로 `C:\Windows\Fonts\malgun.ttf`를 식자 폰트로 사용합니다. 다른 한글 폰트를 쓰려면 `.env`의 `LETTERING_FONT_PATH`를 변경하세요.
 
 기본 번역 모델은 일본어(`jpn_Jpan`)와 한국어(`kor_Hang`)를 지원하는 NLLB-200 distilled 600M이며, `data/models/nllb-200-distilled-600M`에 준비한 뒤 CTranslate2 형식으로 변환합니다. N100에서는 변환 후 INT8 모델만 실행합니다. 모델 경로와 언어 코드는 `.env`의 `AI_TRANSLATION_MODEL_PATH`, `AI_TRANSLATION_TOKENIZER_PATH`, `AI_TRANSLATION_SOURCE_CODE`, `AI_TRANSLATION_TARGET_CODE`로 바꿀 수 있습니다.
+
+대사 문맥과 자연스러운 구어체를 더 반영하려면 Ollama 품질 모드를 사용할 수 있습니다. Ollama를 설치한 뒤 `ollama pull qwen3:4b-instruct`로 약 2.5 GB 모델을 받고, `.env`에서 `AI_TRANSLATION_PROVIDER=ollama`로 바꿔 서버를 다시 시작하세요. 이 모드는 같은 페이지의 앞뒤 말풍선을 문맥으로 제공하고, 번역은 로컬에서 처리합니다. NLLB보다 N100 CPU에서 느릴 수 있습니다. 모델과 주소는 `AI_TRANSLATION_OLLAMA_MODEL`, `AI_TRANSLATION_OLLAMA_URL`로 조정할 수 있습니다.
 
 ```powershell
 & .\ai-worker\.venv\Scripts\hf.exe download facebook/nllb-200-distilled-600M --local-dir data/models/nllb-200-distilled-600M
@@ -64,10 +77,10 @@ Windows에서는 기본적으로 `C:\Windows\Fonts\malgun.ttf`를 식자 폰트�
 & .\ai-worker\.venv\Scripts\hf.exe download opencv/inpainting_lama inpainting_lama_2025jan.onnx --local-dir data/models/lama
 ```
 
-Python 실행 파일이 `python` 명령으로 연결되지 않으면 `.env`의 `AI_WORKER_COMMAND`에 가상 환경의 절대 경로를 지정하세요. 모델 파일과 가상 환경은 Git에 커밋되지 않습니다.
+서버는 `ai-worker/.venv`가 있으면 그 안의 Python을 자동으로 사용합니다. 다른 실행 파일을 쓰려면 `.env`에서 `AI_WORKER_COMMAND`를 지정하세요. 모델 파일과 가상 환경은 Git에 커밋되지 않습니다.
 
 ```powershell
-npm test
+npm.cmd test
 ```
 
 원본과 SQLite 데이터베이스는 기본적으로 `data/` 아래에 저장되며 Git에 커밋되지 않습니다. 운영 환경에서는 `APP_ENV=production`, 긴 `SESSION_SECRET`, Argon2id 비밀번호 해시와 HTTPS를 사용해야 합니다.

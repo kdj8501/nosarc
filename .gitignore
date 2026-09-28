@@ -1,5 +1,7 @@
 node_modules/
+.tools/
 .env
+ai-worker/vendor/comic-text-detector/data/examples/fonts/
 data/*.db
 data/*.db-*
 data/media/

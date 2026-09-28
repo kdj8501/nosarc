@@ -1,0 +1,12 @@
+{
+  "terminal.integrated.env.windows": {
+    "PATH": "${workspaceFolder}\\.tools\\node-v22.23.3-win-x64;${env:PATH}"
+  },
+  "terminal.integrated.profiles.windows": {
+    "Nos Arc PowerShell": {
+      "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      "args": ["-NoLogo", "-NoExit", "-ExecutionPolicy", "RemoteSigned"]
+    }
+  },
+  "terminal.integrated.defaultProfile.windows": "Nos Arc PowerShell"
+}

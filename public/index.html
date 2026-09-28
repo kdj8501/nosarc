@@ -54,7 +54,7 @@
 
     <dialog id="series-dialog">
       <form id="series-form" method="dialog" class="dialog-card">
-        <div class="dialog-header"><h2>작품 추가</h2><button class="icon-button" value="cancel" aria-label="닫기">×</button></div>
+        <div class="dialog-header"><h2>작품 추가</h2><button class="icon-button" type="button" data-dialog-cancel aria-label="닫기">×</button></div>
         <label for="series-title">작품명</label>
         <input id="series-title" required maxlength="200" />
         <label for="series-original-title">원제</label>
@@ -63,13 +63,13 @@
         <input id="series-tags" placeholder="액션, 일상" />
         <label for="series-description">설명</label>
         <textarea id="series-description" rows="3"></textarea>
-        <div class="dialog-actions"><button class="button ghost" value="cancel">취소</button><button class="button primary" value="default">저장</button></div>
+        <div class="dialog-actions"><button class="button ghost" type="button" data-dialog-cancel>취소</button><button class="button primary" value="default">저장</button></div>
       </form>
     </dialog>
 
     <dialog id="chapter-dialog">
       <form id="chapter-form" method="dialog" class="dialog-card">
-        <div class="dialog-header"><h2 id="chapter-dialog-title">권 업로드</h2><button class="icon-button" value="cancel" aria-label="닫기">×</button></div>
+        <div class="dialog-header"><h2 id="chapter-dialog-title">권 업로드</h2><button class="icon-button" type="button" data-dialog-cancel aria-label="닫기">×</button></div>
         <input id="chapter-series-id" type="hidden" />
         <label for="chapter-number">권/화 번호</label>
         <input id="chapter-number" placeholder="예: 1, 0.5, 외전" required />
@@ -79,7 +79,7 @@
         <input id="chapter-files" type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/tiff,application/pdf,application/zip,.cbz" multiple required />
         <div class="upload-promise"><strong>업로드 후 자동으로 처리합니다</strong><span>페이지 준비 → OCR 읽기 → 자동 번역·식자 → 만화 뷰어</span></div>
         <p class="hint">이미지는 선택한 순서대로 저장됩니다. PDF/CBZ도 원본을 보관한 뒤 자동으로 페이지를 준비합니다.</p>
-        <div class="dialog-actions"><button class="button ghost" value="cancel">취소</button><button class="button primary" value="default">업로드하고 처리 시작</button></div>
+        <div class="dialog-actions"><button class="button ghost" type="button" data-dialog-cancel>취소</button><button class="button primary" value="default">업로드하고 처리 시작</button></div>
       </form>
     </dialog>
 

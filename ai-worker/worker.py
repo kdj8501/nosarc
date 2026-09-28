@@ -45,6 +45,7 @@ def translate(request: dict[str, Any]) -> None:
     target_code = str(request.get("targetCode", "kor_Hang"))
     threads = max(1, int(os.environ.get("AI_WORKER_THREADS", "1")))
     batch_size = max(1, int(os.environ.get("AI_TRANSLATION_BATCH_SIZE", "8")))
+    beam_size = max(1, min(8, int(os.environ.get("AI_TRANSLATION_BEAM_SIZE", "4"))))
     translator = ctranslate2.Translator(
         model_path,
         device="cpu",
@@ -71,7 +72,7 @@ def translate(request: dict[str, Any]) -> None:
         batch_prefix = target_prefix[start:end] if target_prefix is not None else None
         results = translator.translate_batch(
             source_tokens[start:end],
-            beam_size=1,
+            beam_size=beam_size,
             batch_type="tokens",
             max_batch_size=batch_size,
             target_prefix=batch_prefix,
@@ -107,7 +108,7 @@ def recognize_manga(request: dict[str, Any]) -> None:
         raise RuntimeError("Manga OCR 대상 페이지가 없습니다.")
 
     model_name = os.environ.get("OCR_MANGA_MODEL", "kha-white/manga-ocr-base")
-    padding = max(0.0, min(0.2, float(os.environ.get("OCR_MANGA_PADDING", "0.04"))))
+    padding = max(0.0, min(0.5, float(os.environ.get("OCR_MANGA_PADDING", "0.12"))))
     mocr = MangaOcr(pretrained_model_name_or_path=model_name, force_cpu=True)
     emit({"type": "progress", "stage": "manga-model-loaded", "progress": 5})
     total = sum(len(page.get("candidates", [])) for page in pages)
@@ -130,10 +131,16 @@ def recognize_manga(request: dict[str, Any]) -> None:
                 if len(points) < 3:
                     completed += 1
                     continue
-                min_x = max(0, int((min(point[0] for point in points) - padding) * width))
-                min_y = max(0, int((min(point[1] for point in points) - padding) * height))
-                max_x = min(width, int((max(point[0] for point in points) + padding) * width))
-                max_y = min(height, int((max(point[1] for point in points) + padding) * height))
+                left = min(point[0] for point in points) * width
+                top = min(point[1] for point in points) * height
+                right = max(point[0] for point in points) * width
+                bottom = max(point[1] for point in points) * height
+                pad_x = max(2, round((right - left) * padding))
+                pad_y = max(2, round((bottom - top) * padding))
+                min_x = max(0, int(left) - pad_x)
+                min_y = max(0, int(top) - pad_y)
+                max_x = min(width, int(right) + pad_x)
+                max_y = min(height, int(bottom) + pad_y)
                 text = ""
                 if max_x > min_x and max_y > min_y:
                     text = str(mocr(image.crop((min_x, min_y, max_x, max_y)))).strip()
@@ -145,6 +152,52 @@ def recognize_manga(request: dict[str, Any]) -> None:
                     "progress": 5 + int(((completed + 1) / max(total, 1)) * 90),
                 })
                 completed += 1
+    emit({"type": "done", "progress": 100})
+
+
+def detect_comic_text(request: dict[str, Any]) -> None:
+    try:
+        import cv2
+        import numpy as np
+        from comic_detector import ComicTextDetector
+    except ImportError as error:
+        raise RuntimeError(
+            "Comic Text Detector dependencies are missing. Install ai-worker/requirements-cpu.txt."
+        ) from error
+
+    pages = request.get("pages", [])
+    if not pages:
+        raise RuntimeError("Comic text detection received no pages.")
+
+    model_path = os.environ.get("OCR_TEXT_DETECTOR_MODEL_PATH", "")
+    if not model_path or not os.path.isfile(model_path):
+        raise RuntimeError(f"Comic text detector model not found: {model_path}")
+
+    detector = ComicTextDetector(model_path=model_path)
+    emit({"type": "progress", "stage": "comic-detector-loaded", "progress": 5})
+    for page_index, page in enumerate(pages):
+        image_path = str(page.get("imagePath", ""))
+        if not image_path or not os.path.isfile(image_path):
+            raise RuntimeError(f"OCR image not found: {image_path}")
+        image_bytes = np.fromfile(image_path, dtype=np.uint8)
+        image = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
+        if image is None:
+            raise RuntimeError(f"Could not decode OCR image: {image_path}")
+
+        candidates = detector.detect(image)
+        for candidate_index, candidate in enumerate(candidates):
+            emit({
+                "type": "detection_result",
+                "pageIndex": int(page.get("pageIndex", page_index)),
+                "candidateIndex": candidate_index,
+                **candidate,
+                "progress": 5 + int(((page_index + 1) / len(pages)) * 90),
+            })
+        emit({
+            "type": "progress",
+            "stage": "detecting-comic-text",
+            "progress": 5 + int(((page_index + 1) / len(pages)) * 90),
+        })
     emit({"type": "done", "progress": 100})
 
 
@@ -217,6 +270,8 @@ def main() -> int:
             request = json.loads(raw_line.decode("utf-8"))
             if request.get("kind", "translate") == "ocr":
                 recognize_manga(request)
+            elif request.get("kind") == "detect":
+                detect_comic_text(request)
             elif request.get("kind") == "inpaint":
                 inpaint_lama(request)
             else:

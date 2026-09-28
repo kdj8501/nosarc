@@ -69,42 +69,48 @@ function markMask(mask, width, height, layer, padding) {
 
 function inpaint(imageData, mask, width, height) {
   const { data } = imageData;
+  const original = new Uint8ClampedArray(data);
   for (let y = 0; y < height; y += 1) {
     const rowOffset = y * width;
-    let x = 0;
-    while (x < width) {
-      if (!mask[rowOffset + x]) {
-        x += 1;
-        continue;
-      }
-      const start = x;
-      while (x + 1 < width && mask[rowOffset + x + 1]) x += 1;
-      const end = x;
-      const left = start > 0 ? readPixel(data, (rowOffset + start - 1) * 4) : null;
-      const right = end + 1 < width ? readPixel(data, (rowOffset + end + 1) * 4) : null;
-      for (let fillX = start; fillX <= end; fillX += 1) {
-        const pixelOffset = (rowOffset + fillX) * 4;
-        if (left && right) {
-          writePixel(data, pixelOffset, averagePixel(left, right));
-        } else {
-          const vertical = findVerticalPixel(data, mask, width, height, fillX, y);
-          writePixel(data, pixelOffset, vertical || left || right || [255, 255, 255, 255]);
-        }
-      }
-      x += 1;
+    for (let x = 0; x < width; x += 1) {
+      if (!mask[rowOffset + x]) continue;
+      const horizontal = interpolateSamples(
+        findMaskBoundary(original, mask, width, height, x, y, -1, 0),
+        findMaskBoundary(original, mask, width, height, x, y, 1, 0),
+      );
+      const vertical = interpolateSamples(
+        findMaskBoundary(original, mask, width, height, x, y, 0, -1),
+        findMaskBoundary(original, mask, width, height, x, y, 0, 1),
+      );
+      const fill = horizontal && vertical
+        ? averagePixel(horizontal, vertical)
+        : horizontal || vertical || [255, 255, 255, 255];
+      writePixel(data, (rowOffset + x) * 4, fill);
     }
   }
 }
 
-function findVerticalPixel(data, mask, width, height, x, y) {
-  let top = y - 1;
-  while (top >= 0 && mask[top * width + x]) top -= 1;
-  let bottom = y + 1;
-  while (bottom < height && mask[bottom * width + x]) bottom += 1;
-  const topPixel = top >= 0 ? readPixel(data, (top * width + x) * 4) : null;
-  const bottomPixel = bottom < height ? readPixel(data, (bottom * width + x) * 4) : null;
-  if (topPixel && bottomPixel) return averagePixel(topPixel, bottomPixel);
-  return topPixel || bottomPixel;
+function findMaskBoundary(data, mask, width, height, x, y, deltaX, deltaY) {
+  let sampleX = x + deltaX;
+  let sampleY = y + deltaY;
+  let distance = 1;
+  while (sampleX >= 0 && sampleX < width && sampleY >= 0 && sampleY < height) {
+    if (!mask[sampleY * width + sampleX]) {
+      return { pixel: readPixel(data, (sampleY * width + sampleX) * 4), distance };
+    }
+    sampleX += deltaX;
+    sampleY += deltaY;
+    distance += 1;
+  }
+  return null;
+}
+
+function interpolateSamples(negative, positive) {
+  if (!negative) return positive?.pixel || null;
+  if (!positive) return negative.pixel;
+  const negativeWeight = positive.distance / (negative.distance + positive.distance);
+  const positiveWeight = negative.distance / (negative.distance + positive.distance);
+  return negative.pixel.map((value, index) => Math.round(value * negativeWeight + positive.pixel[index] * positiveWeight));
 }
 
 function drawLettering(context, layer, width, height, fontFamily) {
@@ -112,46 +118,70 @@ function drawLettering(context, layer, width, height, fontFamily) {
   if (!bounds) return;
   const style = normalizeStyle(layer.style_json || layer.style);
   context.save();
+  context.beginPath();
+  context.rect(bounds.left, bounds.top, bounds.width, bounds.height);
+  context.clip();
   context.fillStyle = style.background;
   context.fillRect(bounds.left, bounds.top, bounds.width, bounds.height);
   context.fillStyle = style.color;
-  context.font = `${style.fontWeight} ${Math.max(8, style.fontSize * Math.max(1, width / 760))}px "${fontFamily}", sans-serif`;
   context.textBaseline = 'middle';
-  if (style.writingMode === 'vertical-rl') drawVerticalText(context, layer.text, bounds, style);
-  else drawHorizontalText(context, layer.text, bounds, style);
+  const baseFontSize = Math.max(8, style.fontSize * Math.max(1, width / 760));
+  if (style.writingMode === 'vertical-rl') drawVerticalText(context, layer.text, bounds, style, fontFamily, baseFontSize);
+  else drawHorizontalText(context, layer.text, bounds, style, fontFamily, baseFontSize);
   context.restore();
 }
 
-function drawHorizontalText(context, value, bounds, style) {
-  const fontSize = style.fontSize * Math.max(1, context.canvas.width / 760);
+function drawHorizontalText(context, value, bounds, style, fontFamily, baseFontSize) {
+  const inset = Math.max(1, Math.min(bounds.width, bounds.height) * 0.08);
+  const maxWidth = Math.max(1, bounds.width - inset * 2);
+  const maxHeight = Math.max(1, bounds.height - inset * 2);
+  let fontSize = baseFontSize;
+  let lines = [' '];
+  while (fontSize > 4) {
+    context.font = `${style.fontWeight} ${fontSize}px "${fontFamily}", sans-serif`;
+    lines = wrapText(context, String(value || ''), maxWidth);
+    if (lines.length * fontSize * 1.15 <= maxHeight && lines.every((line) => context.measureText(line).width <= maxWidth)) break;
+    fontSize = Math.max(4, fontSize - 1);
+  }
+  context.font = `${style.fontWeight} ${fontSize}px "${fontFamily}", sans-serif`;
+  lines = wrapText(context, String(value || ''), maxWidth);
   const lineHeight = fontSize * 1.15;
-  const maxWidth = Math.max(fontSize, bounds.width - fontSize * 0.8);
-  const lines = wrapText(context, String(value || ''), maxWidth);
   const totalHeight = lines.length * lineHeight;
-  const firstY = bounds.top + Math.max(lineHeight / 2, (bounds.height - totalHeight) / 2 + lineHeight / 2);
+  const firstY = bounds.top + (bounds.height - totalHeight) / 2 + lineHeight / 2;
   for (const [index, line] of lines.entries()) {
     const lineWidth = context.measureText(line).width;
     const x = style.textAlign === 'left'
-      ? bounds.left + fontSize * 0.4
+      ? bounds.left + inset
       : style.textAlign === 'right'
-        ? bounds.right - fontSize * 0.4 - lineWidth
+        ? bounds.right - inset - lineWidth
         : bounds.left + (bounds.width - lineWidth) / 2;
     context.fillText(line, x, firstY + index * lineHeight);
   }
 }
 
-function drawVerticalText(context, value, bounds, style) {
-  const fontSize = style.fontSize * Math.max(1, context.canvas.width / 760);
+function drawVerticalText(context, value, bounds, style, fontFamily, baseFontSize) {
+  const inset = Math.max(1, Math.min(bounds.width, bounds.height) * 0.08);
+  const maxWidth = Math.max(1, bounds.width - inset * 2);
+  const maxHeight = Math.max(1, bounds.height - inset * 2);
+  const characters = Array.from(String(value || '').replaceAll('\n', ''));
+  let fontSize = baseFontSize;
+  let rows = 1;
+  let columns = Math.max(1, characters.length);
+  while (fontSize > 4) {
+    rows = Math.max(1, Math.floor(maxHeight / (fontSize * 1.1)));
+    columns = Math.max(1, Math.ceil(characters.length / rows));
+    if (columns * fontSize * 1.15 <= maxWidth) break;
+    fontSize = Math.max(4, fontSize - 1);
+  }
+  rows = Math.max(1, Math.floor(maxHeight / (fontSize * 1.1)));
+  context.font = `${style.fontWeight} ${fontSize}px "${fontFamily}", sans-serif`;
   const lineHeight = fontSize * 1.1;
   const columnWidth = fontSize * 1.15;
-  const rows = Math.max(1, Math.floor((bounds.height - fontSize * 0.4) / lineHeight));
-  const characters = Array.from(String(value || '').replaceAll('\n', ''));
-  const columns = Math.max(1, Math.ceil(characters.length / rows));
   for (const [index, character] of characters.entries()) {
     const column = Math.floor(index / rows);
     const row = index % rows;
-    const x = bounds.right - columnWidth * (column + 0.5);
-    const y = bounds.top + fontSize * 0.3 + row * lineHeight;
+    const x = bounds.right - inset - columnWidth * (column + 0.5);
+    const y = bounds.top + inset + row * lineHeight;
     context.fillText(character, x - context.measureText(character).width / 2, y + fontSize / 2);
   }
 }
@@ -160,16 +190,28 @@ function wrapText(context, value, maxWidth) {
   const lines = [];
   for (const originalLine of value.split(/\r?\n/)) {
     let line = '';
-    for (const character of Array.from(originalLine)) {
-      const candidate = line + character;
-      if (line && context.measureText(candidate).width > maxWidth) {
-        lines.push(line);
-        line = character;
-      } else {
-        line = candidate;
+    const appendWord = (word) => {
+      for (const character of Array.from(word)) {
+        if (line && context.measureText(line + character).width > maxWidth) {
+          lines.push(line.trimEnd());
+          line = character;
+        } else {
+          line += character;
+        }
       }
+    };
+    for (const token of originalLine.match(/\s+|[^\s]+/gu) || []) {
+      if (/^\s+$/u.test(token)) {
+        if (line) line += token;
+        continue;
+      }
+      if (line && context.measureText(line + token).width > maxWidth) {
+        lines.push(line.trimEnd());
+        line = '';
+      }
+      appendWord(token);
     }
-    lines.push(line || ' ');
+    lines.push(line.trimEnd() || ' ');
   }
   return lines.length ? lines : [' '];
 }

@@ -22,6 +22,8 @@ import {
 } from './security.mjs';
 import { createOcrWorker, extractOcrBlocks, recognizePage } from './ocr.mjs';
 import { createInpaintMask, renderTranslatedPage } from './render.mjs';
+import { autoLetteringStyle } from './lettering.mjs';
+import { translateWithOllama } from './translation.mjs';
 
 globalThis.DOMMatrix = canvas.DOMMatrix;
 globalThis.ImageData = canvas.ImageData;
@@ -35,6 +37,11 @@ const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 loadDotEnv(path.join(ROOT, '.env'));
+const venvPythonPath = path.join(ROOT, 'ai-worker', '.venv', process.platform === 'win32' ? 'Scripts' : 'bin', process.platform === 'win32' ? 'python.exe' : 'python');
+const configuredWorkerCommand = String(process.env.AI_WORKER_COMMAND || '').trim();
+const aiWorkerCommand = (!configuredWorkerCommand || ['python', 'python3', 'python.exe', 'python3.exe'].includes(configuredWorkerCommand.toLowerCase())) && fs.existsSync(venvPythonPath)
+  ? venvPythonPath
+  : configuredWorkerCommand || (process.platform === 'win32' ? 'python' : 'python3');
 
 const config = {
   appName: process.env.APP_NAME || 'Nos Arc',
@@ -50,22 +57,26 @@ const config = {
   maxPageBytes: Number(process.env.MAX_PAGE_BYTES || 67108864),
   maxExtractedBytes: Number(process.env.MAX_EXTRACTED_BYTES || 536870912),
   pdfRenderWidth: Number(process.env.PDF_RENDER_WIDTH || 1600),
-  ocrProvider: process.env.OCR_PROVIDER || 'tesseract',
+  ocrProvider: process.env.OCR_PROVIDER || 'manga-ocr',
   ocrLanguage: process.env.OCR_LANGUAGE || 'jpn',
   ocrLangPath: process.env.OCR_LANG_PATH || '',
   ocrCachePath: resolveFromRoot(process.env.OCR_CACHE_PATH || './data/tesseract'),
   ocrMinConfidence: Number(process.env.OCR_MIN_CONFIDENCE || 0.15),
   ocrMangaModel: process.env.OCR_MANGA_MODEL || 'kha-white/manga-ocr-base',
   ocrMangaCachePath: resolveFromRoot(process.env.OCR_MANGA_CACHE_PATH || './data/models/huggingface'),
-  ocrMangaPadding: Number(process.env.OCR_MANGA_PADDING || 0.04),
+  ocrMangaPadding: Number(process.env.OCR_MANGA_PADDING || 0.12),
+  ocrTextDetectorModelPath: resolveFromRoot(process.env.OCR_TEXT_DETECTOR_MODEL_PATH || './data/models/comictextdetector.pt.onnx'),
   inpaintProvider: process.env.INPAINT_PROVIDER || 'lama',
   inpaintModelPath: resolveFromRoot(process.env.INPAINT_MODEL_PATH || './data/models/lama/inpainting_lama_2025jan.onnx'),
   inpaintWorkPath: resolveFromRoot(process.env.INPAINT_WORK_PATH || './data/inpaint'),
   inpaintThreads: Math.max(1, Number(process.env.INPAINT_THREADS || 1)),
   inpaintPadding: Number(process.env.INPAINT_PADDING || 0.008),
   letteringFontPath: process.env.LETTERING_FONT_PATH || (process.platform === 'win32' ? 'C:\\Windows\\Fonts\\malgun.ttf' : ''),
-  aiTranslationProvider: process.env.AI_TRANSLATION_PROVIDER || 'ctranslate2',
-  aiWorkerCommand: process.env.AI_WORKER_COMMAND || 'python',
+  aiTranslationProvider: String(process.env.AI_TRANSLATION_PROVIDER || 'ctranslate2').trim().toLowerCase(),
+  aiTranslationOllamaUrl: process.env.AI_TRANSLATION_OLLAMA_URL || 'http://127.0.0.1:11434',
+  aiTranslationOllamaModel: process.env.AI_TRANSLATION_OLLAMA_MODEL || 'qwen3:4b-instruct',
+  aiTranslationOllamaTimeoutMs: Math.max(30_000, Number(process.env.AI_TRANSLATION_OLLAMA_TIMEOUT_MS || 180_000)),
+  aiWorkerCommand,
   aiWorkerScript: resolveFromRoot(process.env.AI_WORKER_SCRIPT || './ai-worker/worker.py'),
   aiTranslationModelFamily: process.env.AI_TRANSLATION_MODEL_FAMILY || 'nllb',
   aiTranslationModelPath: resolveFromRoot(process.env.AI_TRANSLATION_MODEL_PATH || './data/models/nllb-200-distilled-600M-ct2'),
@@ -73,6 +84,7 @@ const config = {
   aiTranslationSourceCode: process.env.AI_TRANSLATION_SOURCE_CODE || 'jpn_Jpan',
   aiTranslationTargetCode: process.env.AI_TRANSLATION_TARGET_CODE || 'kor_Hang',
   aiTranslationComputeType: process.env.AI_TRANSLATION_COMPUTE_TYPE || 'int8',
+  aiTranslationBeamSize: Math.max(1, Number(process.env.AI_TRANSLATION_BEAM_SIZE || 4)),
   aiTranslationBatchSize: Math.max(1, Number(process.env.AI_TRANSLATION_BATCH_SIZE || 8)),
   aiWorkerThreads: Math.max(1, Number(process.env.AI_WORKER_THREADS || 1)),
 };
@@ -89,6 +101,7 @@ await fsp.mkdir(config.ocrCachePath, { recursive: true });
 await fsp.mkdir(config.ocrMangaCachePath, { recursive: true });
 await fsp.mkdir(config.inpaintWorkPath, { recursive: true });
 await fsp.mkdir(path.dirname(config.inpaintModelPath), { recursive: true });
+await fsp.mkdir(path.dirname(config.ocrTextDetectorModelPath), { recursive: true });
 await fsp.mkdir(path.dirname(config.aiTranslationModelPath), { recursive: true });
 
 const db = new Database(config.databasePath);
@@ -453,7 +466,7 @@ app.post('/api/chapters/:id/ocr', (req, res) => {
 app.post('/api/chapters/:id/auto-translate', (req, res) => {
   const chapter = db.prepare('SELECT * FROM chapters WHERE id = ?').get(req.params.id);
   if (!chapter) return res.status(404).json({ error: '권을 찾을 수 없습니다.' });
-  if (config.aiTranslationProvider !== 'ctranslate2') return res.status(503).json({ error: `현재 번역 제공자(${config.aiTranslationProvider})는 사용할 수 없습니다.` });
+  if (!['ctranslate2', 'ollama'].includes(config.aiTranslationProvider)) return res.status(503).json({ error: `현재 번역 제공자(${config.aiTranslationProvider})는 사용할 수 없습니다.` });
   if (chapter.page_count < 1 || chapter.processing_status !== 'completed') return res.status(409).json({ error: '페이지 변환이 완료된 권에서만 자동 번역을 실행할 수 있습니다.' });
   const blockCount = db.prepare(`SELECT COUNT(*) AS count FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ?`).get(chapter.id).count;
   if (!blockCount) return res.status(409).json({ error: '먼저 OCR을 실행해 번역할 텍스트를 만들어 주세요.' });
@@ -852,35 +865,51 @@ async function runOcrJob(jobId) {
     .run(new Date().toISOString(), jobId);
   let worker;
   try {
-    await clearOcrResults(job.chapter_id);
-    worker = await createOcrWorker(config);
-    activeOcrWorkers.set(jobId, worker);
     const detections = [];
-    for (const [index, page] of pages.entries()) {
+    if (config.ocrProvider === 'manga-ocr') {
+      const blocksByPage = await runComicTextDetectorWorker(jobId, pages, (progress) => {
+        db.prepare('UPDATE jobs SET current_stage = ?, progress = ? WHERE id = ?').run(
+          'detecting', Math.min(45, 5 + Math.round(progress * 0.4)), jobId,
+        );
+      });
       if (isJobCancelled(jobId)) return;
-      const data = await recognizePage(worker, assetPath(page));
-      const blocks = extractOcrBlocks(data, page.width || 1, page.height || 1, { minConfidence: config.ocrMinConfidence });
-      detections.push({ page, blocks });
-      if (config.ocrProvider === 'tesseract') {
-        insertOcrBlocks(page, blocks, new Map(), 'tesseract', 'tesseract.js');
+      for (const page of pages) {
+        detections.push({ page, blocks: blocksByPage.get(page.page_index) || [] });
       }
-      db.prepare('UPDATE jobs SET current_stage = ?, progress = ? WHERE id = ?').run(
-        config.ocrProvider === 'manga-ocr' ? 'detecting' : 'ocr',
-        config.ocrProvider === 'manga-ocr' ? Math.min(45, 5 + Math.round(((index + 1) / pages.length) * 40)) : Math.min(95, Math.round(((index + 1) / pages.length) * 95)),
-        jobId,
-      );
+    } else {
+      worker = await createOcrWorker(config);
+      activeOcrWorkers.set(jobId, worker);
+      for (const [index, page] of pages.entries()) {
+        if (isJobCancelled(jobId)) return;
+        const data = await recognizePage(worker, assetPath(page));
+        const blocks = extractOcrBlocks(data, page.width || 1, page.height || 1, { minConfidence: config.ocrMinConfidence });
+        detections.push({ page, blocks });
+        db.prepare('UPDATE jobs SET current_stage = ?, progress = ? WHERE id = ?').run(
+          'ocr', Math.min(95, Math.round(((index + 1) / pages.length) * 95)), jobId,
+        );
+      }
+      await worker.terminate().catch(() => undefined);
+      worker = null;
     }
-    await worker.terminate().catch(() => undefined);
-    worker = null;
 
     if (config.ocrProvider === 'manga-ocr' && detections.some((detection) => detection.blocks.length)) {
       const recognized = await runMangaOcrWorker(jobId, detections, (progress) => {
         db.prepare('UPDATE jobs SET current_stage = ?, progress = ? WHERE id = ?').run('recognizing', Math.min(95, 45 + Math.round(progress * 0.5)), jobId);
       });
       if (isJobCancelled(jobId)) return;
+      const existingBlockCount = db.prepare('SELECT COUNT(*) AS count FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ?').get(job.chapter_id).count;
+      if (!recognized.size && existingBlockCount) throw new Error('Manga OCR returned no readable text; existing OCR results were kept.');
+      await clearOcrResults(job.chapter_id);
       for (const { page, blocks } of detections) {
-        insertOcrBlocks(page, blocks, recognized, 'manga-ocr', config.ocrMangaModel);
+        insertOcrBlocks(page, blocks, recognized, 'comic-text-detector+manga-ocr', `comictextdetector.pt.onnx + ${config.ocrMangaModel}`);
       }
+    } else if (config.ocrProvider === 'manga-ocr') {
+      const existingBlockCount = db.prepare('SELECT COUNT(*) AS count FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ?').get(job.chapter_id).count;
+      if (existingBlockCount) throw new Error('No text regions were detected; existing OCR results were kept.');
+      await clearOcrResults(job.chapter_id);
+    } else {
+      await clearOcrResults(job.chapter_id);
+      for (const { page, blocks } of detections) insertOcrBlocks(page, blocks, new Map(), 'tesseract', 'tesseract.js');
     }
     const finishedAt = new Date().toISOString();
     db.prepare(`UPDATE jobs SET status = 'completed', current_stage = 'completed', progress = 100, finished_at = ?, error_message = NULL WHERE id = ?`).run(finishedAt, jobId);
@@ -1113,19 +1142,40 @@ async function runAutoTranslationJob(jobId) {
     .run(new Date().toISOString(), jobId);
   try {
     await clearRenderedPages(chapter.id);
-    const results = await runTranslationWorker(jobId, {
-      sourceLanguage: 'ja',
-      targetLanguage: chapter.target_language || 'ko',
-      sourceCode: config.aiTranslationSourceCode,
-      targetCode: config.aiTranslationTargetCode,
-      texts: blocks.map((block) => block.source_text),
-    }, (progress) => {
+    const updateTranslationProgress = (progress) => {
       db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(95, 5 + Math.round(progress * 0.9)), jobId);
-    });
+    };
+    let results;
+    if (config.aiTranslationProvider === 'ollama') {
+      const controller = new AbortController();
+      activeAiProcesses.set(jobId, { kill: () => controller.abort() });
+      results = await translateWithOllama(blocks, {
+        baseUrl: config.aiTranslationOllamaUrl,
+        model: config.aiTranslationOllamaModel,
+        targetLanguage: chapter.target_language || 'ko',
+        batchSize: config.aiTranslationBatchSize,
+        timeoutMs: config.aiTranslationOllamaTimeoutMs,
+        signal: controller.signal,
+        isCancelled: () => isJobCancelled(jobId),
+        onProgress: updateTranslationProgress,
+      });
+    } else {
+      results = await runTranslationWorker(jobId, {
+        sourceLanguage: 'ja',
+        targetLanguage: chapter.target_language || 'ko',
+        sourceCode: config.aiTranslationSourceCode,
+        targetCode: config.aiTranslationTargetCode,
+        texts: blocks.map((block) => block.source_text),
+      }, updateTranslationProgress);
+    }
     if (isJobCancelled(jobId)) return;
     if (!Array.isArray(results) || results.length !== blocks.length) throw new Error('AI 워커가 모든 OCR 블록의 번역 결과를 반환하지 않았습니다.');
 
     const now = new Date().toISOString();
+    const translatorId = config.aiTranslationProvider === 'ollama' ? 'ollama' : 'ctranslate2';
+    const translatorVersion = config.aiTranslationProvider === 'ollama'
+      ? config.aiTranslationOllamaModel
+      : path.basename(config.aiTranslationModelPath);
     const saveTranslations = db.transaction(() => {
       for (const [index, result] of results.entries()) {
         const translatedText = String(result?.text || '').trim();
@@ -1136,13 +1186,14 @@ async function runAutoTranslationJob(jobId) {
         db.prepare(`UPDATE translations SET is_active = 0, updated_at = ? WHERE ocr_block_id = ? AND target_language = ?`).run(now, block.id, chapter.target_language || 'ko');
         db.prepare(`UPDATE lettering_layers SET is_active = 0, updated_at = ? WHERE translation_id IN (SELECT id FROM translations WHERE ocr_block_id = ? AND target_language = ?)`).run(now, block.id, chapter.target_language || 'ko');
         db.prepare(`INSERT INTO translations (id, ocr_block_id, source_language, target_language, translated_text, translator_id, translator_version, glossary_version, is_active, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, 'ctranslate2', ?, NULL, 1, ?, ?)`).run(
+          VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)`).run(
           translationId,
           block.id,
           block.source_language || 'ja',
           chapter.target_language || 'ko',
           translatedText,
-          path.basename(config.aiTranslationModelPath),
+          translatorId,
+          translatorVersion,
           now,
           now,
         );
@@ -1153,7 +1204,7 @@ async function runAutoTranslationJob(jobId) {
           translationId,
           block.polygon_json,
           translatedText,
-          JSON.stringify(autoLetteringStyle(block)),
+          JSON.stringify(autoLetteringStyle(block, translatedText, chapter.target_language || 'ko')),
           now,
           now,
         );
@@ -1175,22 +1226,6 @@ async function runAutoTranslationJob(jobId) {
   }
 }
 
-function autoLetteringStyle(block) {
-  const polygon = parseJson(block.polygon_json, []);
-  const points = polygon.filter((point) => Number.isFinite(Number(point.x)) && Number.isFinite(Number(point.y)));
-  if (!points.length) return normalizeLetteringStyle({ color: '#21121a', background: 'rgba(255, 255, 255, 0.92)' });
-  const xs = points.map((point) => Number(point.x));
-  const ys = points.map((point) => Number(point.y));
-  const width = Math.max(...xs) - Math.min(...xs);
-  const height = Math.max(...ys) - Math.min(...ys);
-  return normalizeLetteringStyle({
-    color: '#21121a',
-    background: 'rgba(255, 255, 255, 0.92)',
-    writingMode: height > width * 1.25 ? 'vertical-rl' : 'horizontal-tb',
-    fontSize: height > width * 1.25 ? 22 : 20,
-  });
-}
-
 function runAiWorkerProcess(jobId, payload, onEvent, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     if (!fs.existsSync(config.aiWorkerScript)) {
@@ -1208,11 +1243,13 @@ function runAiWorkerProcess(jobId, payload, onEvent, extraEnv = {}) {
           AI_TRANSLATION_MODEL_PATH: config.aiTranslationModelPath,
           AI_TRANSLATION_TOKENIZER_PATH: config.aiTranslationTokenizerPath,
           AI_TRANSLATION_COMPUTE_TYPE: config.aiTranslationComputeType,
+          AI_TRANSLATION_BEAM_SIZE: String(config.aiTranslationBeamSize),
           AI_TRANSLATION_BATCH_SIZE: String(config.aiTranslationBatchSize),
           AI_WORKER_THREADS: String(config.aiWorkerThreads),
           HF_HOME: config.ocrMangaCachePath,
           OCR_MANGA_MODEL: config.ocrMangaModel,
           OCR_MANGA_PADDING: String(config.ocrMangaPadding),
+          OCR_TEXT_DETECTOR_MODEL_PATH: config.ocrTextDetectorModelPath,
           INPAINT_PROVIDER: config.inpaintProvider,
           INPAINT_MODEL_PATH: config.inpaintModelPath,
           INPAINT_THREADS: String(config.inpaintThreads),
@@ -1309,6 +1346,35 @@ async function runMangaOcrWorker(jobId, detections, onProgress) {
     }
   });
   return results;
+}
+
+async function runComicTextDetectorWorker(jobId, pages, onProgress) {
+  const blocksByPage = new Map(pages.map((page) => [page.page_index, []]));
+  const detectorPages = pages.map((page) => ({ pageIndex: page.page_index, imagePath: assetPath(page) }));
+  await runAiWorkerProcess(jobId, { kind: 'detect', pages: detectorPages }, (event) => {
+    if (event.type === 'progress') {
+      onProgress(Math.min(100, Math.max(0, Number(event.progress) || 0)));
+    }
+    if (event.type === 'detection_result' && Number.isInteger(event.pageIndex) && Number.isInteger(event.candidateIndex)) {
+      const [left, top, right, bottom] = Array.isArray(event.bbox) ? event.bbox.map(Number) : [];
+      if (![left, top, right, bottom].every(Number.isFinite)) return;
+      const blocks = blocksByPage.get(event.pageIndex);
+      if (!blocks) return;
+      blocks[event.candidateIndex] = {
+        polygon: [
+          { x: left, y: top }, { x: right, y: top },
+          { x: right, y: bottom }, { x: left, y: bottom },
+        ],
+        sourceText: '',
+        confidence: event.confidence == null || !Number.isFinite(Number(event.confidence)) ? null : Number(event.confidence),
+        readingOrder: event.candidateIndex,
+      };
+    }
+  });
+  for (const [pageIndex, blocks] of blocksByPage) {
+    blocksByPage.set(pageIndex, blocks.filter(Boolean));
+  }
+  return blocksByPage;
 }
 
 async function runLamaInpaintWorker(jobId, pages, onProgress) {

@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",
+    "setup:ai": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-ai.ps1",
     "test": "node --test"
   },
   "dependencies": {
