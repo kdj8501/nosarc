@@ -7,7 +7,7 @@ const CLOSING_PUNCTUATION = new Set(Array.from('、。，．！？：；）〕�
 const OPENING_PUNCTUATION = new Set(Array.from('（〔［｛〈《「『【〘〖〝‘“([{"\''));
 
 export async function renderTranslatedPage(sourcePath, layers, {
-  inpaintPadding = 0.008,
+  inpaintPadding = 0.12,
   fontFamily = 'Malgun Gothic',
   fontPath = '',
   skipInpaint = false,
@@ -24,7 +24,7 @@ export async function renderTranslatedPage(sourcePath, layers, {
   const safeLayers = layers.filter((layer) => getBounds(layer.polygon_json || layer.polygon, width, height));
   if (!skipInpaint) {
     const imageData = context.getImageData(0, 0, width, height);
-    const maskImage = createMaskCanvas(width, height, safeLayers, inpaintPadding);
+    const maskImage = createMaskCanvas(width, height, safeLayers, inpaintPadding, imageData.data);
     const maskPixels = maskImage.getContext('2d').getImageData(0, 0, width, height).data;
     const mask = new Uint8Array(width * height);
     for (let pixel = 0; pixel < mask.length; pixel += 1) mask[pixel] = maskPixels[pixel * 4] > 0 ? 1 : 0;
@@ -36,12 +36,16 @@ export async function renderTranslatedPage(sourcePath, layers, {
   return output.toBuffer('image/png');
 }
 
-export async function createInpaintMask(sourcePath, layers, { inpaintPadding = 0.008 } = {}) {
+export async function createInpaintMask(sourcePath, layers, { inpaintPadding = 0.12 } = {}) {
   const image = await loadImage(sourcePath);
-  return createMaskCanvas(image.width, image.height, layers, inpaintPadding).toBuffer('image/png');
+  const sourceCanvas = createCanvas(image.width, image.height);
+  const sourceContext = sourceCanvas.getContext('2d');
+  sourceContext.drawImage(image, 0, 0, image.width, image.height);
+  const imagePixels = sourceContext.getImageData(0, 0, image.width, image.height).data;
+  return createMaskCanvas(image.width, image.height, layers, inpaintPadding, imagePixels).toBuffer('image/png');
 }
 
-function createMaskCanvas(width, height, layers, padding) {
+function createMaskCanvas(width, height, layers, padding, imagePixels = null) {
   const maskCanvas = createCanvas(width, height);
   const context = maskCanvas.getContext('2d');
   context.fillStyle = '#000000';
@@ -50,9 +54,19 @@ function createMaskCanvas(width, height, layers, padding) {
   context.strokeStyle = '#ffffff';
   context.lineJoin = 'round';
   context.lineCap = 'round';
-  const paddingRatio = Math.min(0.12, Math.max(0, Number(padding) || 0));
+  const paddingRatio = Math.min(0.24, Math.max(0, Number(padding) || 0));
   for (const layer of layers) {
-    const polygons = getInpaintPolygons(layer);
+    const polygons = [...getInpaintPolygons(layer)];
+    const sourcePolygon = getSourcePolygon(layer);
+    if (sourcePolygon && (hasConfidentBalloonBox(layer, sourcePolygon) || hasLightUniformBackground(
+      sourcePolygon,
+      getInpaintPolygons(layer),
+      width,
+      height,
+      imagePixels,
+    ))) {
+      polygons.push(sourcePolygon);
+    }
     for (const polygon of polygons) {
       const points = polygon
         .map((point) => ({ x: Number(point?.x), y: Number(point?.y) }))
@@ -83,9 +97,86 @@ function getInpaintPolygons(layer) {
   const value = layer.inpaint_mask_json || layer.inpaintMask;
   const parsed = typeof value === 'string' ? parseJson(value, []) : value;
   if (Array.isArray(parsed) && parsed.length && Array.isArray(parsed[0])) return parsed;
-  const polygon = layer.source_polygon_json || layer.polygon_json || layer.polygon;
-  const fallback = typeof polygon === 'string' ? parseJson(polygon, []) : polygon;
-  return Array.isArray(fallback) ? [fallback] : [];
+  const fallback = getSourcePolygon(layer) || layer.polygon_json || layer.polygon;
+  const polygon = typeof fallback === 'string' ? parseJson(fallback, []) : fallback;
+  return Array.isArray(polygon) ? [polygon] : [];
+}
+
+function getSourcePolygon(layer) {
+  const value = layer.source_polygon_json;
+  if (!value) return null;
+  const polygon = typeof value === 'string' ? parseJson(value, []) : value;
+  return Array.isArray(polygon) && polygon.length >= 3 ? polygon : null;
+}
+
+function hasConfidentBalloonBox(layer, sourcePolygon) {
+  const layout = typeof layer.source_layout_hint_json === 'string'
+    ? parseJson(layer.source_layout_hint_json, {})
+    : layer.source_layout_hint_json || {};
+  const sourceArea = polygonBoundsArea(sourcePolygon);
+  const balloonArea = polygonBoundsArea(layout.letteringPolygon);
+  return sourceArea > 0 && balloonArea > 0 && balloonArea <= sourceArea * 4;
+}
+
+function hasLightUniformBackground(sourcePolygon, glyphPolygons, width, height, pixels) {
+  if (!pixels) return false;
+  const points = sourcePolygon
+    .map((point) => ({ x: Number(point?.x) * width, y: Number(point?.y) * height }))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  if (points.length < 3) return false;
+  const left = Math.max(0, Math.floor(Math.min(...points.map((point) => point.x))));
+  const right = Math.min(width, Math.ceil(Math.max(...points.map((point) => point.x))));
+  const top = Math.max(0, Math.floor(Math.min(...points.map((point) => point.y))));
+  const bottom = Math.min(height, Math.ceil(Math.max(...points.map((point) => point.y))));
+  const shortSide = Math.min(right - left, bottom - top);
+  if (shortSide < 10) return false;
+  const band = Math.max(2, Math.round(shortSide * 0.16));
+  const scaledGlyphs = glyphPolygons.map((polygon) => polygon
+    .map((point) => ({ x: Number(point?.x) * width, y: Number(point?.y) * height }))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y)))
+    .filter((polygon) => polygon.length >= 3);
+  let count = 0;
+  let sum = 0;
+  let sumSquares = 0;
+  let bright = 0;
+  for (let y = top; y < bottom; y += 2) {
+    for (let x = left; x < right; x += 2) {
+      if (x - left >= band && right - 1 - x >= band && y - top >= band && bottom - 1 - y >= band) continue;
+      if (scaledGlyphs.some((polygon) => pointInPolygon(x + 0.5, y + 0.5, polygon))) continue;
+      const offset = (y * width + x) * 4;
+      const luminance = pixels[offset] * 0.299 + pixels[offset + 1] * 0.587 + pixels[offset + 2] * 0.114;
+      count += 1;
+      sum += luminance;
+      sumSquares += luminance * luminance;
+      if (luminance >= 230) bright += 1;
+    }
+  }
+  if (count < 12) return false;
+  const mean = sum / count;
+  const deviation = Math.sqrt(Math.max(0, sumSquares / count - mean * mean));
+  return mean >= 245 && deviation <= 38 && bright / count >= 0.92;
+}
+
+function pointInPolygon(x, y, polygon) {
+  let inside = false;
+  for (let current = 0, previous = polygon.length - 1; current < polygon.length; previous = current, current += 1) {
+    const left = polygon[current];
+    const right = polygon[previous];
+    if (((left.y > y) !== (right.y > y))
+      && x < ((right.x - left.x) * (y - left.y)) / (right.y - left.y) + left.x) inside = !inside;
+  }
+  return inside;
+}
+
+function polygonBoundsArea(polygon) {
+  if (!Array.isArray(polygon) || polygon.length < 3) return 0;
+  const points = polygon
+    .map((point) => ({ x: Number(point?.x), y: Number(point?.y) }))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  if (points.length < 3) return 0;
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  return Math.max(0, Math.max(...xs) - Math.min(...xs)) * Math.max(0, Math.max(...ys) - Math.min(...ys));
 }
 
 async function inpaint(imageData, mask, width, height, onProgress) {
@@ -175,12 +266,16 @@ function drawHorizontalText(context, value, bounds, style, fontFamily, baseFontS
   let lines = [' '];
   while (fontSize > 4) {
     context.font = `${style.fontWeight} ${fontSize}px "${fontFamily}", sans-serif`;
-    lines = wrapText(context, String(value || ''), maxWidth);
+    lines = style.balanceLines
+      ? wrapTextBalanced(context, String(value || ''), maxWidth)
+      : wrapText(context, String(value || ''), maxWidth);
     if (lines.length * fontSize * 1.1 <= maxHeight && lines.every((line) => context.measureText(line).width <= maxWidth)) break;
     fontSize = Math.max(4, fontSize - 1);
   }
   context.font = `${style.fontWeight} ${fontSize}px "${fontFamily}", sans-serif`;
-  lines = wrapText(context, String(value || ''), maxWidth);
+  lines = style.balanceLines
+    ? wrapTextBalanced(context, String(value || ''), maxWidth)
+    : wrapText(context, String(value || ''), maxWidth);
   const lineHeight = fontSize * 1.1;
   const totalHeight = lines.length * lineHeight;
   const firstY = bounds.top + (bounds.height - totalHeight) / 2 + lineHeight / 2;
@@ -228,12 +323,20 @@ function drawTextWithOutline(context, text, x, y, color, fontSize, style = {}) {
   const green = Number.parseInt(hex.slice(2, 4), 16);
   const blue = Number.parseInt(hex.slice(4, 6), 16);
   const luminance = (red * 299 + green * 587 + blue * 114) / 1000;
-  context.lineJoin = 'round';
-  context.lineWidth = Math.max(0.8, Math.min(6, Number(style.outlineWidth) || Math.min(2, fontSize * 0.07)));
-  context.strokeStyle = style.outlineColor
-    ? hexToRgba(style.outlineColor, style.outlineColor === '#ffffff' ? 0.92 : 0.78)
-    : luminance >= 145 ? 'rgba(25, 18, 27, 0.78)' : 'rgba(255, 255, 255, 0.92)';
-  context.strokeText(text, x, y);
+  const requestedOutlineWidth = Number(style.outlineWidth);
+  const outlineWidth = luminance >= 210
+    ? 0
+    : Number.isFinite(requestedOutlineWidth)
+    ? Math.min(6, Math.max(0, requestedOutlineWidth))
+    : Math.min(2, fontSize * 0.07);
+  if (outlineWidth > 0) {
+    context.lineJoin = 'round';
+    context.lineWidth = Math.max(0.8, outlineWidth);
+    context.strokeStyle = style.outlineColor
+      ? hexToRgba(style.outlineColor, style.outlineColor === '#ffffff' ? 0.92 : 0.78)
+      : luminance >= 145 ? 'rgba(25, 18, 27, 0.78)' : 'rgba(255, 255, 255, 0.92)';
+    context.strokeText(text, x, y);
+  }
   context.fillStyle = color;
   context.fillText(text, x, y);
 }
@@ -293,6 +396,59 @@ function wrapText(context, value, maxWidth) {
   return lines.length ? lines : [' '];
 }
 
+function wrapTextBalanced(context, value, maxWidth) {
+  const lines = [];
+  for (const paragraph of String(value || '').split(/\r?\n/u)) {
+    const words = paragraph.trim().split(/\s+/u).filter(Boolean);
+    if (words.length < 2 || words.some((word) => context.measureText(word).width > maxWidth)) {
+      lines.push(...wrapText(context, paragraph, maxWidth));
+      continue;
+    }
+
+    const costs = Array(words.length + 1).fill(Number.POSITIVE_INFINITY);
+    const nextWord = Array(words.length).fill(-1);
+    costs[words.length] = 0;
+    for (let start = words.length - 1; start >= 0; start -= 1) {
+      let line = '';
+      for (let end = start; end < words.length; end += 1) {
+        line = line ? `${line} ${words[end]}` : words[end];
+        const lineWidth = context.measureText(line).width;
+        if (lineWidth > maxWidth) break;
+        if (end < words.length - 1 && !canBreakAfterWord(words[end], words[end + 1])) continue;
+        if (!Number.isFinite(costs[end + 1])) continue;
+
+        const remainingWidth = Math.max(0, maxWidth - lineWidth) / maxWidth;
+        const finalLineWeight = end === words.length - 1 ? 0.3 : 1;
+        const shortWordPenalty = end < words.length - 1 && Array.from(words[end]).length === 1 ? 0.08 : 0;
+        const lineCost = remainingWidth ** 2 * finalLineWeight + shortWordPenalty + (end < words.length - 1 ? 0.015 : 0);
+        const candidateCost = lineCost + costs[end + 1];
+        if (candidateCost < costs[start]) {
+          costs[start] = candidateCost;
+          nextWord[start] = end + 1;
+        }
+      }
+    }
+
+    if (nextWord[0] < 0) {
+      lines.push(...wrapText(context, paragraph, maxWidth));
+      continue;
+    }
+    for (let start = 0; start < words.length;) {
+      const end = nextWord[start];
+      if (end <= start) break;
+      lines.push(words.slice(start, end).join(' '));
+      start = end;
+    }
+  }
+  return lines.length ? lines : [' '];
+}
+
+function canBreakAfterWord(previous, next) {
+  const lastCharacter = Array.from(previous).at(-1) || '';
+  const firstCharacter = Array.from(next)[0] || '';
+  return !OPENING_PUNCTUATION.has(lastCharacter) && !CLOSING_PUNCTUATION.has(firstCharacter);
+}
+
 function getBounds(value, width, height) {
   const polygon = typeof value === 'string' ? parseJson(value, []) : value;
   if (!Array.isArray(polygon)) return null;
@@ -323,8 +479,9 @@ function normalizeStyle(value) {
     textAlign: ['center', 'left', 'right'].includes(style.textAlign) ? style.textAlign : 'center',
     fontWeight: ['400', '600', '700'].includes(String(style.fontWeight)) ? String(style.fontWeight) : '600',
     rotation: Number.isFinite(Number(style.rotation)) ? Math.min(45, Math.max(-45, Number(style.rotation))) : 0,
-    outlineWidth: Number.isFinite(Number(style.outlineWidth)) ? Math.min(6, Math.max(0.8, Number(style.outlineWidth))) : 1.4,
+    outlineWidth: Number.isFinite(Number(style.outlineWidth)) ? Math.min(6, Math.max(0, Number(style.outlineWidth))) : 1.4,
     outlineColor: /^#[0-9a-f]{6}$/i.test(String(style.outlineColor || '')) ? String(style.outlineColor) : '',
+    balanceLines: style.balanceLines === true,
     soundEffect: style.soundEffect === true,
   };
 }

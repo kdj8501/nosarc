@@ -1,6 +1,7 @@
 const KOREAN_LANGUAGE = /^(?:ko|kor)(?:[-_]|$)/i;
 const HANGUL = /[\uac00-\ud7af]/g;
 const HAS_HANGUL = /[\uac00-\ud7af]/;
+const MAX_BALLOON_AREA_RATIO = 4;
 
 export function autoLetteringStyle(block, translatedText = '', targetLanguage = '', contentKind = '') {
   const polygon = parsePolygon(block?.polygon_json);
@@ -16,7 +17,14 @@ export function autoLetteringStyle(block, translatedText = '', targetLanguage = 
   const sourceBox = polygonDimensions(points);
   const balloonPoints = parsePolygon(layout.letteringPolygon)
     .filter((point) => Number.isFinite(Number(point?.x)) && Number.isFinite(Number(point?.y)));
-  const fitBox = !soundEffect && balloonPoints.length >= 3 ? polygonDimensions(balloonPoints) : sourceBox;
+  const balloonBox = polygonDimensions(balloonPoints);
+  const sourceArea = sourceBox.width * sourceBox.height;
+  const balloonArea = balloonBox.width * balloonBox.height;
+  const useBalloonBox = !soundEffect
+    && balloonPoints.length >= 3
+    && sourceArea > 0
+    && balloonArea <= sourceArea * MAX_BALLOON_AREA_RATIO;
+  const fitBox = useBalloonBox ? balloonBox : sourceBox;
   const width = sourceBox.width;
   const height = sourceBox.height;
 
@@ -34,13 +42,14 @@ export function autoLetteringStyle(block, translatedText = '', targetLanguage = 
 
   return {
     color,
-    outlineColor: soundEffect ? contrastingOutline(color) : '',
+    outlineColor: contrastingOutline(color),
     background: 'rgba(255, 255, 255, 0)',
     writingMode,
     fontSize: Math.round(Math.min(32, estimateFontSize(block, text, fitBox.width, fitBox.height) * (soundEffect ? 1.12 : 1))),
     fontWeight: soundEffect ? '700' : '600',
-    outlineWidth: soundEffect ? 2.6 : 1.2,
+    outlineWidth: colorLuminance(color) >= 210 ? 0 : soundEffect ? 2.6 : 0,
     rotation: soundEffect && Number.isFinite(sourceRotation) ? Math.min(45, Math.max(-45, sourceRotation)) : 0,
+    balanceLines: korean,
     soundEffect,
   };
 }
@@ -64,9 +73,12 @@ function looksLikeJapaneseSoundEffect(value) {
 }
 
 function contrastingOutline(color) {
+  return colorLuminance(color) >= 145 ? '#19121b' : '#ffffff';
+}
+
+function colorLuminance(color) {
   const channels = color.match(/[0-9a-f]{2}/gi)?.map((channel) => Number.parseInt(channel, 16)) || [33, 18, 26];
-  const luminance = (channels[0] * 299 + channels[1] * 587 + channels[2] * 114) / 1000;
-  return luminance >= 145 ? '#19121b' : '#ffffff';
+  return (channels[0] * 299 + channels[1] * 587 + channels[2] * 114) / 1000;
 }
 
 function estimateFontSize(block, text, boxWidthRatio, boxHeightRatio) {

@@ -70,12 +70,13 @@ const config = {
   inpaintModelPath: resolveFromRoot(process.env.INPAINT_MODEL_PATH || './data/models/lama/inpainting_lama_2025jan.onnx'),
   inpaintWorkPath: resolveFromRoot(process.env.INPAINT_WORK_PATH || './data/inpaint'),
   inpaintThreads: Math.max(1, Number(process.env.INPAINT_THREADS || 1)),
-  inpaintPadding: Number(process.env.INPAINT_PADDING || 0.008),
+  inpaintPadding: Number(process.env.INPAINT_PADDING || 0.12),
   letteringFontPath: process.env.LETTERING_FONT_PATH || (process.platform === 'win32' ? 'C:\\Windows\\Fonts\\malgun.ttf' : ''),
   aiTranslationProvider: String(process.env.AI_TRANSLATION_PROVIDER || 'ctranslate2').trim().toLowerCase(),
   aiTranslationOllamaUrl: process.env.AI_TRANSLATION_OLLAMA_URL || 'http://127.0.0.1:11434',
-  aiTranslationOllamaModel: process.env.AI_TRANSLATION_OLLAMA_MODEL || 'qwen3:4b-instruct',
+  aiTranslationOllamaModel: process.env.AI_TRANSLATION_OLLAMA_MODEL || 'qwen3:14b',
   aiTranslationOllamaTimeoutMs: Math.max(30_000, Number(process.env.AI_TRANSLATION_OLLAMA_TIMEOUT_MS || 180_000)),
+  aiTranslationOllamaBatchSize: Math.max(1, Number(process.env.AI_TRANSLATION_OLLAMA_BATCH_SIZE || 1)),
   aiWorkerCommand,
   aiWorkerScript: resolveFromRoot(process.env.AI_WORKER_SCRIPT || './ai-worker/worker.py'),
   aiTranslationModelFamily: process.env.AI_TRANSLATION_MODEL_FAMILY || 'nllb',
@@ -572,7 +573,10 @@ app.post('/api/ocr-blocks/:id/translations', async (req, res) => {
   const translatedText = String(req.body?.translatedText || '').trim();
   if (!translatedText) return res.status(400).json({ error: '번역문을 입력해 주세요.' });
   const targetLanguage = normalizeLanguage(req.body?.targetLanguage, block.series_target_language || 'ko');
-  const style = normalizeLetteringStyle(req.body?.style);
+  const style = normalizeLetteringStyle(
+    req.body?.style,
+    autoLetteringStyle(block, translatedText, targetLanguage),
+  );
   const now = new Date().toISOString();
   const translationId = crypto.randomUUID();
   const layerId = crypto.randomUUID();
@@ -1052,10 +1056,19 @@ async function runRenderJob(jobId) {
 async function renderChapterImages(chapterId, jobId = null, onProgress = () => {}) {
   const pages = db.prepare(`SELECT p.*, a.storage_key, a.original_name, a.mime_type
     FROM pages p JOIN assets a ON a.id = p.image_asset_id WHERE p.chapter_id = ? ORDER BY p.page_index`).all(chapterId);
-  const layers = db.prepare(`SELECT l.*, b.inpaint_mask_json, b.polygon_json AS source_polygon_json FROM lettering_layers l JOIN pages p ON p.id = l.page_id
+  const layers = db.prepare(`SELECT l.*, b.inpaint_mask_json, b.polygon_json AS source_polygon_json,
+      b.layout_hint_json AS source_layout_hint_json FROM lettering_layers l JOIN pages p ON p.id = l.page_id
     LEFT JOIN translations t ON t.id = l.translation_id
     LEFT JOIN ocr_blocks b ON b.id = t.ocr_block_id
     WHERE p.chapter_id = ? AND l.is_active = 1 AND TRIM(l.text) <> '' ORDER BY l.created_at`).all(chapterId);
+  for (const layer of layers) {
+    const sourcePolygon = parseJson(layer.source_polygon_json, []);
+    const sourceBounds = getNormalizedPolygonBounds(sourcePolygon);
+    const letteringBounds = getNormalizedPolygonBounds(parseJson(layer.polygon_json, []));
+    if (sourceBounds?.area > 0 && letteringBounds?.area > sourceBounds.area * 4) {
+      layer.polygon_json = layer.source_polygon_json;
+    }
+  }
   const layersByPage = groupBy(layers, 'page_id');
   const workToken = crypto.randomUUID();
   const inpaintPages = [];
@@ -1172,7 +1185,6 @@ async function runAutoTranslationJob(jobId) {
   db.prepare(`UPDATE jobs SET status = 'running', current_stage = 'translation', progress = 1, started_at = ?, error_message = NULL WHERE id = ?`)
     .run(new Date().toISOString(), jobId);
   try {
-    await clearRenderedPages(chapter.id);
     const updateTranslationProgress = (progress) => {
       db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(75, 3 + Math.round(progress * 0.72)), jobId);
     };
@@ -1184,7 +1196,7 @@ async function runAutoTranslationJob(jobId) {
         baseUrl: config.aiTranslationOllamaUrl,
         model: config.aiTranslationOllamaModel,
         targetLanguage: chapter.target_language || 'ko',
-        batchSize: config.aiTranslationBatchSize,
+         batchSize: config.aiTranslationOllamaBatchSize,
         timeoutMs: config.aiTranslationOllamaTimeoutMs,
         signal: controller.signal,
         isCancelled: () => isJobCancelled(jobId),
@@ -1248,6 +1260,7 @@ async function runAutoTranslationJob(jobId) {
     });
     saveTranslations();
     if (isJobCancelled(jobId)) return;
+    if (config.aiTranslationProvider === 'ollama') await unloadOllamaTranslationModel();
     db.prepare('UPDATE jobs SET current_stage = ?, progress = ? WHERE id = ?').run('rendering', 75, jobId);
     const rendered = await renderChapterImages(chapter.id, jobId, (progress) => {
       db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(99, 75 + Math.round(progress * 0.24)), jobId);
@@ -1259,6 +1272,20 @@ async function runAutoTranslationJob(jobId) {
     if (!isJobCancelled(jobId)) await failAutoTranslationJob(jobId, error.message || '자동 번역에 실패했습니다.');
   } finally {
     activeAiProcesses.delete(jobId);
+  }
+}
+
+async function unloadOllamaTranslationModel() {
+  try {
+    const response = await fetch(`${String(config.aiTranslationOllamaUrl).replace(/\/+$/, '')}/api/generate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: config.aiTranslationOllamaModel, prompt: '', stream: false, keep_alive: 0 }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) console.warn(`Ollama 번역 모델 메모리 해제 실패 (${response.status}).`);
+  } catch (error) {
+    console.warn(`Ollama 번역 모델 메모리를 해제하지 못했습니다: ${error.message}`);
   }
 }
 
@@ -1481,8 +1508,12 @@ function normalizeOptionalPolygon(value) {
 
 function getAutomaticLetteringPolygon(block) {
   const layoutHint = parseJson(block?.layout_hint_json, {});
-  return normalizeOptionalPolygon(layoutHint.letteringPolygon)
-    || parseJson(block?.polygon_json, []);
+  const sourcePolygon = parseJson(block?.polygon_json, []);
+  const candidate = normalizeOptionalPolygon(layoutHint.letteringPolygon);
+  const sourceBounds = getNormalizedPolygonBounds(sourcePolygon);
+  const candidateBounds = getNormalizedPolygonBounds(candidate);
+  if (candidate && sourceBounds?.area > 0 && candidateBounds?.area <= sourceBounds.area * 4) return candidate;
+  return sourcePolygon;
 }
 
 async function runLamaInpaintWorker(jobId, pages, onProgress) {
@@ -1782,19 +1813,39 @@ function normalizeConfidence(value) {
   return Number.isFinite(confidence) ? Math.min(1, Math.max(0, confidence)) : null;
 }
 
-function normalizeLetteringStyle(value) {
+function normalizeLetteringStyle(value, defaults = {}) {
   const input = typeof value === 'string' ? parseJson(value, {}) : (value || {});
-  const fontSize = Number(input.fontSize);
-  const color = /^#[0-9a-f]{6}$/i.test(String(input.color || '')) ? String(input.color) : '#21121a';
-  const savedBackground = /^rgba?\([0-9.,% ]+\)$/.test(String(input.background || '')) ? String(input.background) : 'rgba(255, 255, 255, 0)';
+  const fontSize = Number(input.fontSize ?? defaults.fontSize);
+  const inputColor = String(input.color ?? defaults.color ?? '');
+  const color = /^#[0-9a-f]{6}$/i.test(inputColor) ? inputColor : '#21121a';
+  const backgroundValue = String(input.background ?? defaults.background ?? '');
+  const savedBackground = /^rgba?\([0-9.,% ]+\)$/.test(backgroundValue) ? backgroundValue : 'rgba(255, 255, 255, 0)';
   const background = savedBackground === 'rgba(255, 255, 255, 0.92)' ? 'rgba(255, 255, 255, 0)' : savedBackground;
+  const writingMode = ['vertical-rl', 'horizontal-tb'].includes(input.writingMode)
+    ? input.writingMode
+    : ['vertical-rl', 'horizontal-tb'].includes(defaults.writingMode) ? defaults.writingMode : 'vertical-rl';
+  const textAlign = ['center', 'left', 'right'].includes(input.textAlign)
+    ? input.textAlign
+    : ['center', 'left', 'right'].includes(defaults.textAlign) ? defaults.textAlign : 'center';
+  const fontWeight = ['400', '600', '700'].includes(String(input.fontWeight ?? defaults.fontWeight))
+    ? String(input.fontWeight ?? defaults.fontWeight)
+    : '600';
+  const rotation = Number(input.rotation ?? defaults.rotation);
+  const outlineWidth = Number(input.outlineWidth ?? defaults.outlineWidth);
+  const outlineColorValue = String(input.outlineColor ?? defaults.outlineColor ?? '');
   return {
     fontSize: Number.isFinite(fontSize) ? Math.min(96, Math.max(8, fontSize)) : 24,
     color,
     background,
-    writingMode: ['vertical-rl', 'horizontal-tb'].includes(input.writingMode) ? input.writingMode : 'vertical-rl',
-    textAlign: ['center', 'left', 'right'].includes(input.textAlign) ? input.textAlign : 'center',
-    fontWeight: ['400', '600', '700'].includes(String(input.fontWeight)) ? String(input.fontWeight) : '600',
+    writingMode,
+    textAlign,
+    fontWeight,
+    rotation: Number.isFinite(rotation) ? Math.min(45, Math.max(-45, rotation)) : 0,
+    outlineWidth: Number.isFinite(outlineWidth) ? Math.min(6, Math.max(0, outlineWidth)) : 1.4,
+    outlineColor: /^#[0-9a-f]{6}$/i.test(outlineColorValue) ? outlineColorValue : '',
+    balloonFit: input.balloonFit === false ? false : input.balloonFit === true || defaults.balloonFit === true,
+    balanceLines: input.balanceLines === false ? false : input.balanceLines === true || defaults.balanceLines === true,
+    soundEffect: input.soundEffect === false ? false : input.soundEffect === true || defaults.soundEffect === true,
   };
 }
 

@@ -63,7 +63,7 @@ async function loadSeries(search = '') {
   const series = await request(`/api/series?search=${encodeURIComponent(search)}`);
   if (!series) return;
   state.series = series;
-  $('#series-list').innerHTML = series.length ? series.map(renderSeries).join('') : '<div class="series-card"><p class="muted">아직 작품이 없습니다. 첫 작품을 추가해 보세요.</p></div>';
+  $('#series-list').innerHTML = series.length ? series.map(renderSeries).join('') : '<div class="series-card empty-state"><p class="muted">아직 작품이 없습니다.<br />첫 작품을 추가해 보세요.</p></div>';
   document.querySelectorAll('[data-upload]').forEach((button) => button.addEventListener('click', () => openChapter(button.dataset.upload, button.dataset.title)));
   document.querySelectorAll('[data-open]').forEach((button) => button.addEventListener('click', () => openSeries(button.dataset.open)));
   document.querySelectorAll('[data-delete-series]').forEach((button) => button.addEventListener('click', () => deleteSeries(button.dataset.deleteSeries, button.dataset.title)));
@@ -261,10 +261,22 @@ function renderLetteringLayer(layer) {
   const fontWeight = ['400', '600', '700'].includes(String(style.fontWeight)) ? style.fontWeight : '600';
   const soundEffect = style.soundEffect === true;
   const rotation = Number.isFinite(Number(style.rotation)) ? Math.min(45, Math.max(-45, Number(style.rotation))) : 0;
-  const outlineWidth = soundEffect && Number.isFinite(Number(style.outlineWidth)) ? Math.min(6, Math.max(0.8, Number(style.outlineWidth))) : 0;
-  const outlineColor = /^#[0-9a-f]{6}$/i.test(String(style.outlineColor || '')) ? style.outlineColor : '#ffffff';
+  const channels = color.match(/[0-9a-f]{2}/gi).map((channel) => Number.parseInt(channel, 16));
+  const luminance = (channels[0] * 299 + channels[1] * 587 + channels[2] * 114) / 1000;
+  const outlineWidth = luminance >= 210
+    ? 0
+    : Number.isFinite(Number(style.outlineWidth))
+    ? Math.min(6, Math.max(0, Number(style.outlineWidth)))
+    : soundEffect ? 2.6 : 1.2;
+  const fallbackOutline = luminance >= 145 ? '#19121b' : '#ffffff';
+  const outlineColor = /^#[0-9a-f]{6}$/i.test(String(style.outlineColor || '')) ? style.outlineColor : fallbackOutline;
   const css = `left:${bounds.left}%;top:${bounds.top}%;width:${bounds.width}%;height:${bounds.height}%;font-size:${fontSize / 7.6}cqw;color:${color};background:${background};writing-mode:${writingMode};text-align:${textAlign};font-weight:${fontWeight};transform:rotate(${rotation}deg);-webkit-text-stroke:${outlineWidth / 7.6}cqw ${outlineColor};paint-order:stroke fill;`;
-  return `<div class="lettering-layer${soundEffect ? ' lettering-effect' : ''}" style="${css}">${escapeHtml(layer.text).replaceAll('\n', '<br />')}</div>`;
+  const classes = [
+    'lettering-layer',
+    soundEffect ? 'lettering-effect' : '',
+    style.balanceLines === true ? 'lettering-balanced' : '',
+  ].filter(Boolean).join(' ');
+  return `<div class="${classes}" style="${css}">${escapeHtml(layer.text).replaceAll('\n', '<br />')}</div>`;
 }
 
 function polygonBounds(polygon = []) {
