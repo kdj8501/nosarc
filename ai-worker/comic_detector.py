@@ -156,7 +156,9 @@ def _estimate_speech_balloon_box(
     text_width = max(1, right - left)
     text_height = max(1, bottom - top)
     pad_x = max(24, int(text_width * 2.0))
-    pad_y = max(24, int(text_height * 1.15))
+    # Vertical dialogue often sits in tall balloons whose outline is farther
+    # from the text than a glyph-sized crop can see.
+    pad_y = max(32, int(text_height * 2.0))
     crop_left = max(0, left - pad_x)
     crop_top = max(0, top - pad_y)
     crop_right = min(width, right + pad_x)
@@ -168,6 +170,9 @@ def _estimate_speech_balloon_box(
 
     gray = cv2.cvtColor(image[crop_top:crop_bottom, crop_left:crop_right], cv2.COLOR_BGR2GRAY)
     _, white = cv2.threshold(gray, 238, 255, cv2.THRESH_BINARY)
+    # Restore tiny gaps caused by screen-tone dots inside otherwise white
+    # balloon interiors without using a wide kernel that can cross outlines.
+    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
     local_left = max(0, left - crop_left)
     local_top = max(0, top - crop_top)
     local_right = min(crop_width, right - crop_left)

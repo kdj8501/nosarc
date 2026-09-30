@@ -21,8 +21,8 @@ import {
   verifySessionToken,
 } from './security.mjs';
 import { createOcrWorker, extractOcrBlocks, recognizePage } from './ocr.mjs';
-import { createInpaintMask, renderTranslatedPage } from './render.mjs';
-import { autoLetteringStyle } from './lettering.mjs';
+import { createInpaintMask, isRenderableLetteringLayer, renderTranslatedPage } from './render.mjs';
+import { autoLetteringStyle, inferLetteringContentKind } from './lettering.mjs';
 import { isKoreanTargetLanguage, isKoreanText, translateWithOllama } from './translation.mjs';
 
 globalThis.DOMMatrix = canvas.DOMMatrix;
@@ -74,8 +74,9 @@ const config = {
   letteringFontPath: process.env.LETTERING_FONT_PATH || (process.platform === 'win32' ? 'C:\\Windows\\Fonts\\malgun.ttf' : ''),
   aiTranslationProvider: String(process.env.AI_TRANSLATION_PROVIDER || 'ctranslate2').trim().toLowerCase(),
   aiTranslationOllamaUrl: process.env.AI_TRANSLATION_OLLAMA_URL || 'http://127.0.0.1:11434',
-  aiTranslationOllamaModel: process.env.AI_TRANSLATION_OLLAMA_MODEL || 'qwen3:14b',
-  aiTranslationOllamaTimeoutMs: Math.max(30_000, Number(process.env.AI_TRANSLATION_OLLAMA_TIMEOUT_MS || 180_000)),
+  aiTranslationOllamaModel: process.env.AI_TRANSLATION_OLLAMA_MODEL || 'qwen3:8b',
+  aiTranslationOllamaTimeoutMs: Math.max(30_000, Number(process.env.AI_TRANSLATION_OLLAMA_TIMEOUT_MS || 300_000)),
+  aiTranslationOllamaThink: ['1', 'true', 'yes'].includes(String(process.env.AI_TRANSLATION_OLLAMA_THINK || 'false').trim().toLowerCase()),
   aiTranslationOllamaBatchSize: Math.max(1, Number(process.env.AI_TRANSLATION_OLLAMA_BATCH_SIZE || 1)),
   aiWorkerCommand,
   aiWorkerScript: resolveFromRoot(process.env.AI_WORKER_SCRIPT || './ai-worker/worker.py'),
@@ -189,6 +190,26 @@ db.exec(`
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS lettering_style_profiles (
+    series_id TEXT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+    content_kind TEXT NOT NULL CHECK(content_kind IN ('dialogue', 'caption', 'sound_effect')),
+    style_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(series_id, content_kind)
+  );
+  CREATE TABLE IF NOT EXISTS series_terms (
+    id TEXT PRIMARY KEY,
+    series_id TEXT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+    source_term TEXT NOT NULL,
+    source_reading TEXT,
+    target_term TEXT NOT NULL,
+    aliases_json TEXT NOT NULL DEFAULT '[]',
+    kind TEXT NOT NULL CHECK(kind IN ('person', 'place', 'organization', 'series_term')),
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(series_id, source_term)
+  );
   CREATE TABLE IF NOT EXISTS lettering_layers (
     id TEXT PRIMARY KEY,
     page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
@@ -225,8 +246,12 @@ if (!ocrBlockColumns.some((column) => column.name === 'inpaint_mask_json')) {
 if (!db.prepare('PRAGMA table_info(ocr_blocks)').all().some((column) => column.name === 'layout_hint_json')) {
   db.exec('ALTER TABLE ocr_blocks ADD COLUMN layout_hint_json TEXT');
 }
+if (!db.prepare('PRAGMA table_info(translations)').all().some((column) => column.name === 'content_kind')) {
+  db.exec('ALTER TABLE translations ADD COLUMN content_kind TEXT');
+}
 
 const sessions = new Map();
+let processingTaskQueue = Promise.resolve();
 const ingestQueue = [];
 let ingestActive = false;
 const ocrQueue = [];
@@ -237,6 +262,13 @@ const renderQueue = [];
 let renderActive = false;
 const activeAiProcesses = new Map();
 const activeOcrWorkers = new Map();
+
+function runInProcessingTaskQueue(task) {
+  const next = processingTaskQueue.then(task, task);
+  processingTaskQueue = next.catch(() => undefined);
+  return next;
+}
+
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '2mb' }));
@@ -350,7 +382,65 @@ app.post('/api/series', (req, res) => {
 app.get('/api/series/:id', (req, res) => {
   const series = getSeries(req.params.id);
   if (!series) return res.status(404).json({ error: '작품을 찾을 수 없습니다.' });
-  res.json({ ...series, chapters: listChapters(req.params.id) });
+  res.json({ ...series, chapters: listChapters(req.params.id), glossary: listSeriesTerms(req.params.id) });
+});
+
+app.put('/api/series/:id/glossary', (req, res) => {
+  const series = getSeries(req.params.id);
+  if (!series) return res.status(404).json({ error: '작품을 찾을 수 없습니다.' });
+  const sourceTerm = String(req.body?.sourceTerm || '').trim();
+  const targetTerm = String(req.body?.targetTerm || '').trim();
+  const sourceReading = String(req.body?.sourceReading || '').trim();
+  const notes = String(req.body?.notes || '').trim();
+  const requestedKind = String(req.body?.kind || '').trim();
+  const kind = normalizeGlossaryKind(requestedKind) || (requestedKind ? null : 'series_term');
+  const rawAliases = Array.isArray(req.body?.aliases) ? req.body.aliases : [];
+  if (!kind) return res.status(400).json({ error: '용어 분류를 확인해 주세요.' });
+  if (rawAliases.length > 20) return res.status(400).json({ error: '별칭은 최대 20개까지 등록할 수 있습니다.' });
+  const aliases = [...new Set(rawAliases
+    .map((alias) => String(alias || '').trim())
+    .filter((alias) => alias && alias !== sourceTerm))].slice(0, 20);
+  if (!sourceTerm || sourceTerm.length > 100 || !targetTerm || targetTerm.length > 100) {
+    return res.status(400).json({ error: '원문과 번역 표기는 각각 1~100자로 입력해 주세요.' });
+  }
+  if (sourceReading.length > 100 || notes.length > 500) {
+    return res.status(400).json({ error: '읽는 법은 100자, 메모는 500자 이내로 입력해 주세요.' });
+  }
+  if (aliases.some((alias) => alias.length > 100)) {
+    return res.status(400).json({ error: '별칭은 각각 100자 이내로 입력해 주세요.' });
+  }
+  const now = new Date().toISOString();
+  const id = crypto.randomUUID();
+  db.prepare(`INSERT INTO series_terms (id, series_id, source_term, source_reading, target_term, aliases_json, kind, notes, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(series_id, source_term) DO UPDATE SET source_reading = excluded.source_reading, target_term = excluded.target_term,
+      aliases_json = excluded.aliases_json, kind = excluded.kind, notes = excluded.notes, updated_at = excluded.updated_at`)
+    .run(id, series.id, sourceTerm, sourceReading || null, targetTerm, JSON.stringify(aliases), kind, notes || null, now, now);
+  const saved = db.prepare('SELECT * FROM series_terms WHERE series_id = ? AND source_term = ?').get(series.id, sourceTerm);
+  res.json(serializeSeriesTerm(saved));
+});
+
+app.delete('/api/series/:id/glossary/:termId', (req, res) => {
+  const series = getSeries(req.params.id);
+  if (!series) return res.status(404).json({ error: '작품을 찾을 수 없습니다.' });
+  const result = db.prepare('DELETE FROM series_terms WHERE id = ? AND series_id = ?').run(req.params.termId, series.id);
+  if (!result.changes) return res.status(404).json({ error: '용어를 찾을 수 없습니다.' });
+  res.json({ id: req.params.termId, deleted: true });
+});
+
+app.put('/api/series/:id/lettering-style-profiles/:kind', (req, res) => {
+  const series = getSeries(req.params.id);
+  if (!series) return res.status(404).json({ error: '작품을 찾을 수 없습니다.' });
+  const contentKind = normalizeLetteringContentKind(req.params.kind);
+  if (!contentKind || contentKind === 'unknown') {
+    return res.status(400).json({ error: '대사, 나레이션, 효과음 중 하나를 선택해 주세요.' });
+  }
+  const style = normalizeLetteringStyle(req.body?.style);
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO lettering_style_profiles (series_id, content_kind, style_json, updated_at)
+    VALUES (?, ?, ?, ?) ON CONFLICT(series_id, content_kind) DO UPDATE SET style_json = excluded.style_json, updated_at = excluded.updated_at`)
+    .run(series.id, contentKind, JSON.stringify(style), now);
+  res.json({ content_kind: contentKind, style, updated_at: now });
 });
 
 app.patch('/api/series/:id', (req, res) => {
@@ -566,16 +656,25 @@ app.patch('/api/ocr-blocks/:id', async (req, res) => {
 });
 
 app.post('/api/ocr-blocks/:id/translations', async (req, res) => {
-  const block = db.prepare(`SELECT b.*, s.target_language AS series_target_language FROM ocr_blocks b
+  const block = db.prepare(`SELECT b.*, c.series_id, s.target_language AS series_target_language FROM ocr_blocks b
     JOIN pages p ON p.id = b.page_id JOIN chapters c ON c.id = p.chapter_id JOIN series s ON s.id = c.series_id
     WHERE b.id = ?`).get(req.params.id);
   if (!block) return res.status(404).json({ error: 'OCR 블록을 찾을 수 없습니다.' });
   const translatedText = String(req.body?.translatedText || '').trim();
   if (!translatedText) return res.status(400).json({ error: '번역문을 입력해 주세요.' });
   const targetLanguage = normalizeLanguage(req.body?.targetLanguage, block.series_target_language || 'ko');
+  const contentKind = normalizeLetteringContentKind(req.body?.contentKind)
+    || inferLetteringContentKind(block, req.body?.contentKind);
+  const glossaryVersion = getSeriesGlossaryVersion(listSeriesTerms(block.series_id));
+  const styleProfile = getLetteringStyleProfile(block.series_id, contentKind);
+  const styleDefaults = applyLetteringStyleProfile(
+    autoLetteringStyle(block, translatedText, targetLanguage, contentKind),
+    styleProfile,
+    contentKind,
+  );
   const style = normalizeLetteringStyle(
     req.body?.style,
-    autoLetteringStyle(block, translatedText, targetLanguage),
+    styleDefaults,
   );
   const now = new Date().toISOString();
   const translationId = crypto.randomUUID();
@@ -583,8 +682,8 @@ app.post('/api/ocr-blocks/:id/translations', async (req, res) => {
   const create = db.transaction(() => {
     db.prepare(`UPDATE translations SET is_active = 0, updated_at = ? WHERE ocr_block_id = ? AND target_language = ?`).run(now, block.id, targetLanguage);
     db.prepare(`UPDATE lettering_layers SET is_active = 0, updated_at = ? WHERE translation_id IN (SELECT id FROM translations WHERE ocr_block_id = ? AND target_language = ?)`).run(now, block.id, targetLanguage);
-    db.prepare(`INSERT INTO translations (id, ocr_block_id, source_language, target_language, translated_text, translator_id, translator_version, glossary_version, is_active, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(
+    db.prepare(`INSERT INTO translations (id, ocr_block_id, source_language, target_language, translated_text, translator_id, translator_version, glossary_version, content_kind, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(
       translationId,
       block.id,
       block.source_language,
@@ -592,7 +691,8 @@ app.post('/api/ocr-blocks/:id/translations', async (req, res) => {
       translatedText,
       cleanOptional(req.body?.translatorId),
       cleanOptional(req.body?.translatorVersion),
-      cleanOptional(req.body?.glossaryVersion),
+      cleanOptional(req.body?.glossaryVersion) || glossaryVersion,
+      contentKind,
       now,
       now,
     );
@@ -719,6 +819,42 @@ function getSeries(id) {
   return row || null;
 }
 
+function normalizeGlossaryKind(value) {
+  const kind = String(value || '').trim().toLowerCase();
+  return ['person', 'place', 'organization', 'series_term'].includes(kind) ? kind : null;
+}
+
+function listSeriesTerms(seriesId) {
+  return db.prepare('SELECT * FROM series_terms WHERE series_id = ? ORDER BY kind, source_term COLLATE NOCASE').all(seriesId)
+    .map(serializeSeriesTerm);
+}
+
+function serializeSeriesTerm(term) {
+  return {
+    ...term,
+    aliases: parseJson(term.aliases_json, []),
+  };
+}
+
+function getSeriesGlossaryVersion(terms) {
+  const stableTerms = terms.map(({ source_term, source_reading, target_term, aliases, kind, notes }) => ({
+    source_term, source_reading, target_term, aliases, kind, notes,
+  }));
+  return crypto.createHash('sha256').update(JSON.stringify(stableTerms)).digest('hex').slice(0, 16);
+}
+
+function applyGlossaryToSourceText(value, terms) {
+  let text = String(value || '');
+  const replacements = terms.flatMap((term) => [
+    term.source_term,
+    term.source_reading,
+    ...(Array.isArray(term.aliases) ? term.aliases : []),
+  ].filter(Boolean).map((source) => ({ source: String(source), target: term.target_term })))
+    .sort((left, right) => right.source.length - left.source.length);
+  for (const { source, target } of replacements) text = text.split(source).join(target);
+  return text;
+}
+
 function listChapterIds(seriesId) {
   return db.prepare('SELECT id FROM chapters WHERE series_id = ?').all(seriesId).map((chapter) => chapter.id);
 }
@@ -793,6 +929,7 @@ function getChapter(id) {
   const chapter = db.prepare(`SELECT c.*, s.title AS series_title, s.target_language, a.original_name AS source_name FROM chapters c
     JOIN series s ON s.id = c.series_id JOIN assets a ON a.id = c.source_asset_id WHERE c.id = ?`).get(id);
   if (!chapter) return null;
+  chapter.lettering_style_profiles = getLetteringStyleProfiles(chapter.series_id);
   const pages = db.prepare(`SELECT p.*, a.mime_type, a.original_name, a.id AS asset_id, ra.id AS translated_asset_id, ra.mime_type AS translated_mime_type FROM pages p JOIN assets a ON a.id = p.image_asset_id
     LEFT JOIN assets ra ON ra.id = p.rendered_asset_id
     WHERE p.chapter_id = ? ORDER BY p.page_index`).all(id);
@@ -871,7 +1008,10 @@ async function drainOcrQueue() {
   if (ocrActive) return;
   ocrActive = true;
   try {
-    while (ocrQueue.length) await runOcrJob(ocrQueue.shift());
+    while (ocrQueue.length) {
+      const jobId = ocrQueue.shift();
+      await runInProcessingTaskQueue(() => runOcrJob(jobId));
+    }
   } finally {
     ocrActive = false;
   }
@@ -1012,7 +1152,10 @@ async function drainAutoTranslationQueue() {
   if (autoTranslationActive) return;
   autoTranslationActive = true;
   try {
-    while (autoTranslationQueue.length) await runAutoTranslationJob(autoTranslationQueue.shift());
+    while (autoTranslationQueue.length) {
+      const jobId = autoTranslationQueue.shift();
+      await runInProcessingTaskQueue(() => runAutoTranslationJob(jobId));
+    }
   } finally {
     autoTranslationActive = false;
   }
@@ -1027,7 +1170,10 @@ async function drainRenderQueue() {
   if (renderActive) return;
   renderActive = true;
   try {
-    while (renderQueue.length) await runRenderJob(renderQueue.shift());
+    while (renderQueue.length) {
+      const jobId = renderQueue.shift();
+      await runInProcessingTaskQueue(() => runRenderJob(jobId));
+    }
   } finally {
     renderActive = false;
   }
@@ -1061,11 +1207,15 @@ async function renderChapterImages(chapterId, jobId = null, onProgress = () => {
     LEFT JOIN translations t ON t.id = l.translation_id
     LEFT JOIN ocr_blocks b ON b.id = t.ocr_block_id
     WHERE p.chapter_id = ? AND l.is_active = 1 AND TRIM(l.text) <> '' ORDER BY l.created_at`).all(chapterId);
+  const invalidLayerCount = layers.filter((layer) => !isRenderableLetteringLayer(layer)).length;
+  if (invalidLayerCount) {
+    throw new Error(`글자 위치가 유효하지 않은 식자 레이어 ${invalidLayerCount}개가 있어 원문 제거를 중단했습니다. 위치를 수정한 뒤 다시 실행해 주세요.`);
+  }
   for (const layer of layers) {
     const sourcePolygon = parseJson(layer.source_polygon_json, []);
     const sourceBounds = getNormalizedPolygonBounds(sourcePolygon);
     const letteringBounds = getNormalizedPolygonBounds(parseJson(layer.polygon_json, []));
-    if (sourceBounds?.area > 0 && letteringBounds?.area > sourceBounds.area * 4) {
+    if (sourceBounds?.area > 0 && letteringBounds?.area > sourceBounds.area * 10) {
       layer.polygon_json = layer.source_polygon_json;
     }
   }
@@ -1085,7 +1235,10 @@ async function renderChapterImages(chapterId, jobId = null, onProgress = () => {
     }
 
     let aiOutputs = new Map();
-    if (config.inpaintProvider === 'lama' && inpaintPages.length && fs.existsSync(config.inpaintModelPath)) {
+    if (config.inpaintProvider === 'lama' && inpaintPages.length) {
+      if (!fs.existsSync(config.inpaintModelPath)) {
+        throw new Error('LaMa 인페인팅 모델 파일을 찾을 수 없어 식질을 중단했습니다. 저품질 보간 결과는 저장하지 않습니다.');
+      }
       try {
         aiOutputs = await runLamaInpaintWorker(jobId || workToken, inpaintPages, (progress) => {
           const fraction = Math.min(1, Math.max(0, (progress - 5) / 90));
@@ -1094,7 +1247,14 @@ async function renderChapterImages(chapterId, jobId = null, onProgress = () => {
         });
       } catch (error) {
         if (jobId && isJobCancelled(jobId)) return false;
-        console.warn(`LaMa 인페인팅을 사용할 수 없어 CPU 보간으로 대체합니다: ${error.message}`);
+        throw new Error(`LaMa 인페인팅에 실패해 식질 결과를 저장하지 않았습니다: ${error.message}`);
+      }
+      const missingInpaintOutputs = inpaintPages.filter((page) => {
+        const outputPath = aiOutputs.get(page.pageId);
+        return !outputPath || !fs.existsSync(outputPath);
+      });
+      if (missingInpaintOutputs.length) {
+        throw new Error(`LaMa 인페인팅 결과가 없는 페이지 ${missingInpaintOutputs.length}개가 있어 식질을 중단했습니다.`);
       }
     }
 
@@ -1181,9 +1341,13 @@ async function runAutoTranslationJob(jobId) {
   const chapter = db.prepare(`SELECT c.*, s.target_language FROM chapters c JOIN series s ON s.id = c.series_id WHERE c.id = ?`).get(job.chapter_id);
   const blocks = db.prepare(`SELECT b.*, p.width, p.height FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ? ORDER BY p.page_index, b.reading_order, b.created_at`).all(job.chapter_id);
   if (!chapter || !blocks.length) return failAutoTranslationJob(jobId, '자동 번역할 OCR 블록이 없습니다.');
+  const styleProfiles = getLetteringStyleProfiles(chapter.series_id);
+  const glossaryTerms = listSeriesTerms(chapter.series_id);
+  const glossaryVersion = getSeriesGlossaryVersion(glossaryTerms);
 
   db.prepare(`UPDATE jobs SET status = 'running', current_stage = 'translation', progress = 1, started_at = ?, error_message = NULL WHERE id = ?`)
     .run(new Date().toISOString(), jobId);
+  let ollamaModelReleased = config.aiTranslationProvider !== 'ollama';
   try {
     const updateTranslationProgress = (progress) => {
       db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(75, 3 + Math.round(progress * 0.72)), jobId);
@@ -1196,7 +1360,16 @@ async function runAutoTranslationJob(jobId) {
         baseUrl: config.aiTranslationOllamaUrl,
         model: config.aiTranslationOllamaModel,
         targetLanguage: chapter.target_language || 'ko',
-         batchSize: config.aiTranslationOllamaBatchSize,
+        batchSize: config.aiTranslationOllamaBatchSize,
+        think: config.aiTranslationOllamaThink,
+        entityGlossary: new Map(glossaryTerms.map((term) => [term.source_term, {
+          source: term.source_term,
+          target: term.target_term,
+          reading: term.source_reading,
+          aliases: term.aliases,
+          kind: term.kind,
+          notes: term.notes,
+        }])),
         timeoutMs: config.aiTranslationOllamaTimeoutMs,
         signal: controller.signal,
         isCancelled: () => isJobCancelled(jobId),
@@ -1208,11 +1381,18 @@ async function runAutoTranslationJob(jobId) {
         targetLanguage: chapter.target_language || 'ko',
         sourceCode: config.aiTranslationSourceCode,
         targetCode: config.aiTranslationTargetCode,
-        texts: blocks.map((block) => block.source_text),
+        texts: blocks.map((block) => applyGlossaryToSourceText(block.source_text, glossaryTerms)),
       }, updateTranslationProgress);
     }
     if (isJobCancelled(jobId)) return;
     if (!Array.isArray(results) || results.length !== blocks.length) throw new Error('AI 워커가 모든 OCR 블록의 번역 결과를 반환하지 않았습니다.');
+
+    const missingTranslations = blocks.reduce((count, block, index) => (
+      count + (String(block.source_text || '').trim() && !String(results[index]?.text || '').trim() ? 1 : 0)
+    ), 0);
+    if (missingTranslations) {
+      throw new Error(`번역 결과가 비어 있는 OCR 블록 ${missingTranslations}개가 있어 자동 식질을 중단했습니다. OCR 내용을 확인한 뒤 다시 실행해 주세요.`);
+    }
 
     if (isKoreanTargetLanguage(chapter.target_language || 'ko')
       && results.some((result) => String(result?.text || '').trim() && !isKoreanText(result.text))) {
@@ -1233,8 +1413,9 @@ async function runAutoTranslationJob(jobId) {
         const layerId = crypto.randomUUID();
         db.prepare(`UPDATE translations SET is_active = 0, updated_at = ? WHERE ocr_block_id = ? AND target_language = ?`).run(now, block.id, chapter.target_language || 'ko');
         db.prepare(`UPDATE lettering_layers SET is_active = 0, updated_at = ? WHERE translation_id IN (SELECT id FROM translations WHERE ocr_block_id = ? AND target_language = ?)`).run(now, block.id, chapter.target_language || 'ko');
-        db.prepare(`INSERT INTO translations (id, ocr_block_id, source_language, target_language, translated_text, translator_id, translator_version, glossary_version, is_active, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)`).run(
+        const contentKind = normalizeLetteringContentKind(result.kind) || inferLetteringContentKind(block, result.kind);
+        db.prepare(`INSERT INTO translations (id, ocr_block_id, source_language, target_language, translated_text, translator_id, translator_version, glossary_version, content_kind, is_active, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(
           translationId,
           block.id,
           block.source_language || 'ja',
@@ -1242,6 +1423,8 @@ async function runAutoTranslationJob(jobId) {
           translatedText,
           translatorId,
           translatorVersion,
+          glossaryVersion,
+          contentKind,
           now,
           now,
         );
@@ -1252,7 +1435,11 @@ async function runAutoTranslationJob(jobId) {
           translationId,
           JSON.stringify(getAutomaticLetteringPolygon(block)),
           translatedText,
-          JSON.stringify(autoLetteringStyle(block, translatedText, chapter.target_language || 'ko', result.kind)),
+          JSON.stringify(applyLetteringStyleProfile(
+            autoLetteringStyle(block, translatedText, chapter.target_language || 'ko', contentKind),
+            styleProfiles[contentKind],
+            contentKind,
+          )),
           now,
           now,
         );
@@ -1260,7 +1447,7 @@ async function runAutoTranslationJob(jobId) {
     });
     saveTranslations();
     if (isJobCancelled(jobId)) return;
-    if (config.aiTranslationProvider === 'ollama') await unloadOllamaTranslationModel();
+    if (config.aiTranslationProvider === 'ollama') ollamaModelReleased = await unloadOllamaTranslationModel();
     db.prepare('UPDATE jobs SET current_stage = ?, progress = ? WHERE id = ?').run('rendering', 75, jobId);
     const rendered = await renderChapterImages(chapter.id, jobId, (progress) => {
       db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(99, 75 + Math.round(progress * 0.24)), jobId);
@@ -1271,8 +1458,38 @@ async function runAutoTranslationJob(jobId) {
   } catch (error) {
     if (!isJobCancelled(jobId)) await failAutoTranslationJob(jobId, error.message || '자동 번역에 실패했습니다.');
   } finally {
+    if (!ollamaModelReleased) await unloadOllamaTranslationModel();
     activeAiProcesses.delete(jobId);
   }
+}
+
+function normalizeLetteringContentKind(value) {
+  const kind = String(value || '').trim().toLowerCase();
+  return ['dialogue', 'caption', 'sound_effect'].includes(kind) ? kind : null;
+}
+
+function getLetteringStyleProfiles(seriesId) {
+  const profiles = {};
+  for (const row of db.prepare('SELECT content_kind, style_json FROM lettering_style_profiles WHERE series_id = ?').all(seriesId)) {
+    const kind = normalizeLetteringContentKind(row.content_kind);
+    if (kind) profiles[kind] = normalizeLetteringStyle(row.style_json);
+  }
+  return profiles;
+}
+
+function getLetteringStyleProfile(seriesId, contentKind) {
+  const kind = normalizeLetteringContentKind(contentKind);
+  if (!kind) return null;
+  const row = db.prepare('SELECT style_json FROM lettering_style_profiles WHERE series_id = ? AND content_kind = ?').get(seriesId, kind);
+  return row ? normalizeLetteringStyle(row.style_json) : null;
+}
+
+function applyLetteringStyleProfile(defaults, profile, contentKind) {
+  const profileFields = ['fontSize', 'color', 'writingMode', 'textAlign', 'fontWeight', 'rotation', 'outlineWidth', 'outlineColor'];
+  const overrides = Object.fromEntries(profileFields
+    .filter((field) => profile?.[field] !== undefined)
+    .map((field) => [field, profile[field]]));
+  return normalizeLetteringStyle({ ...defaults, ...overrides, soundEffect: contentKind === 'sound_effect' }, defaults);
 }
 
 async function unloadOllamaTranslationModel() {
@@ -1283,9 +1500,14 @@ async function unloadOllamaTranslationModel() {
       body: JSON.stringify({ model: config.aiTranslationOllamaModel, prompt: '', stream: false, keep_alive: 0 }),
       signal: AbortSignal.timeout(15_000),
     });
-    if (!response.ok) console.warn(`Ollama 번역 모델 메모리 해제 실패 (${response.status}).`);
+    if (!response.ok) {
+      console.warn(`Ollama 번역 모델 메모리 해제 실패 (${response.status}).`);
+      return false;
+    }
+    return true;
   } catch (error) {
     console.warn(`Ollama 번역 모델 메모리를 해제하지 못했습니다: ${error.message}`);
+    return false;
   }
 }
 
@@ -1512,7 +1734,7 @@ function getAutomaticLetteringPolygon(block) {
   const candidate = normalizeOptionalPolygon(layoutHint.letteringPolygon);
   const sourceBounds = getNormalizedPolygonBounds(sourcePolygon);
   const candidateBounds = getNormalizedPolygonBounds(candidate);
-  if (candidate && sourceBounds?.area > 0 && candidateBounds?.area <= sourceBounds.area * 4) return candidate;
+  if (candidate && sourceBounds?.area > 0 && candidateBounds?.area <= sourceBounds.area * 10) return candidate;
   return sourcePolygon;
 }
 
@@ -1545,7 +1767,8 @@ async function drainIngestQueue() {
   ingestActive = true;
   try {
     while (ingestQueue.length) {
-      await runIngestJob(ingestQueue.shift());
+      const jobId = ingestQueue.shift();
+      await runInProcessingTaskQueue(() => runIngestJob(jobId));
     }
   } finally {
     ingestActive = false;

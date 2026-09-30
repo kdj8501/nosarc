@@ -23,9 +23,11 @@
 
 현재 OCR 기본값(`OCR_PROVIDER=manga-ocr`)은 만화 전용 Comic Text Detector로 페이지에서 글 영역을 찾고, 각 영역을 Manga OCR로 읽습니다. Tesseract 희소 검출과 근접 영역 병합은 더 이상 기본 경로에 사용하지 않습니다. `OCR_PROVIDER=tesseract`로 설정하면 기존 Tesseract OCR만 사용하는 대체 경로로 동작합니다.
 
-리더에서 `번역 편집`을 누르면 OCR 블록별 번역문을 입력하고 세로쓰기/가로쓰기와 글자 크기를 저장할 수 있습니다. 저장된 결과는 번역 모드의 식자 레이어로 표시됩니다. 역식 데이터 API는 `POST /api/pages/:id/ocr-blocks`, `POST /api/ocr-blocks/:id/translations`, `PATCH /api/lettering-layers/:id`이며, 좌표는 페이지 기준 0~1 정규화 좌표를 사용합니다.
+리더에서 `번역 편집`을 누르면 OCR 블록별 번역문과 쓰기 방향, 글자 크기·색, 굵기, 정렬, 외곽선, 기울기를 저장할 수 있습니다. 수정한 스타일은 대사·나레이션·효과음 유형별 작품 기본값으로 저장해 이후 자동 식자에 재사용할 수 있습니다. 역식 데이터 API는 `POST /api/pages/:id/ocr-blocks`, `POST /api/ocr-blocks/:id/translations`, `PATCH /api/lettering-layers/:id`이며, 좌표는 페이지 기준 0~1 정규화 좌표를 사용합니다.
 
-권을 업로드하면 페이지 준비 → OCR → 로컬 자동 번역·식자 작업이 순서대로 백그라운드에서 실행됩니다. 화면의 처리 패널에서 단계와 진행률을 확인할 수 있으며, 자동 역식이 끝나면 번역된 만화 리더를 바로 엽니다. 번역은 블록별 CTranslate2/NLLB 추론을 사용하고 기본 빔 크기는 4입니다. 한국어 자동 식자는 가로쓰기를 우선하고, 매우 좁은 상자 안의 짧은 문구만 세로쓰기를 유지합니다. 렌더러는 복원된 페이지 위에 불투명한 사각 배경을 덮지 않으며, 밝은 글자에는 외곽선을 두르지 않습니다. 말풍선 안쪽 공간에 맞춰 글자 크기를 조정하고, 한국어는 줄 길이를 균형 있게 배분하며 문장부호가 줄 첫머리에 오지 않게 줄바꿈합니다. LaMa 모델이 없으면 4방향 주변 픽셀을 이용한 CPU 보간으로 원문 영역을 채웁니다. 이 보간은 만화 전용 인페인팅 모델의 복원 품질과 같지 않습니다.
+작품 상세의 용어집에는 인물·장소·단체·작품 용어의 원문 표기, 읽는 법, 번역 표기, 별칭, 메모를 저장할 수 있습니다. Ollama 번역에는 현재 문장과 주변 문맥에 등장하는 항목을 전달하고, CTranslate2 번역에는 등록한 원문 표기를 번역 전에 지정한 표기로 치환합니다. 용어집 버전은 번역 결과에 기록됩니다.
+
+권을 업로드하면 페이지 준비 → OCR → 로컬 자동 번역·식자 작업이 백그라운드에서 이어집니다. 업로드 직후 처리 창은 띄우지 않으며, 메인 처리 패널에서 단계와 진행률을 확인할 수 있습니다. 번역은 블록별 CTranslate2/NLLB 추론을 사용하고 기본 빔 크기는 4입니다. 한국어 자동 식자는 가로쓰기를 우선하고, 매우 좁은 상자 안의 짧은 문구만 세로쓰기를 유지합니다. 렌더러는 복원된 페이지 위에 불투명한 사각 배경을 덮지 않으며, 밝은 글자에는 외곽선을 두르지 않습니다. 말풍선 안쪽 공간에 맞춰 글자 크기를 조정하고, 한국어는 줄 길이를 균형 있게 배분하며 문장부호가 줄 첫머리에 오지 않게 줄바꿈합니다. LaMa 모델을 사용하는데 모델 파일이 없거나 처리가 실패하면 저품질 CPU 보간으로 대체하지 않고 식질 작업을 실패 처리합니다.
 
 ## OCR 모델 준비
 
@@ -66,7 +68,7 @@ Windows에서는 기본적으로 `C:\Windows\Fonts\malgun.ttf`를 식자 폰트�
 
 기본 번역 모델은 일본어(`jpn_Jpan`)와 한국어(`kor_Hang`)를 지원하는 NLLB-200 distilled 600M이며, `data/models/nllb-200-distilled-600M`에 준비한 뒤 CTranslate2 형식으로 변환합니다. N100에서는 변환 후 INT8 모델만 실행합니다. 모델 경로와 언어 코드는 `.env`의 `AI_TRANSLATION_MODEL_PATH`, `AI_TRANSLATION_TOKENIZER_PATH`, `AI_TRANSLATION_SOURCE_CODE`, `AI_TRANSLATION_TARGET_CODE`로 바꿀 수 있습니다.
 
-번역 품질을 우선할 때는 Ollama의 `qwen3:14b`를 사용할 수 있습니다. `ollama pull qwen3:14b`로 약 9.3 GB 모델을 받고, `.env`에서 `AI_TRANSLATION_PROVIDER=ollama`로 설정한 뒤 서버를 다시 시작하세요. 16 GB N100에서도 실행할 수 있지만 8B보다 메모리 여유가 적고 CPU 번역이 더 느립니다. 각 대사는 별도 요청으로 번역하되 같은 페이지의 원문 앞뒤 대사와 누적 용어집을 참고해 문맥·인명을 유지합니다. 한국어 표현은 별도 교정 단계에서 다시 다듬고, 말풍선 대사·나레이션·효과음을 구분합니다. 모델, 주소, 요청 묶음 크기는 `AI_TRANSLATION_OLLAMA_MODEL`, `AI_TRANSLATION_OLLAMA_URL`, `AI_TRANSLATION_OLLAMA_BATCH_SIZE`로 조정할 수 있습니다.
+번역 모델은 8B 급 이하로 제한합니다. Ollama의 `qwen3:8b`가 기본값이며, 로컬 `.env`에서 `AI_TRANSLATION_PROVIDER=ollama`로 설정하고 서버를 다시 시작하세요. 각 대사는 별도 요청으로 번역하되 같은 페이지의 앞뒤 대사와 작품 용어집을 참고해 문맥·인명을 유지합니다. 한국어 표현은 별도 교정 단계에서 다듬고 말풍선 대사·나레이션·효과음을 구분합니다. 모델, 주소, 요청 묶음 크기, 타임아웃, 추론 모드는 `AI_TRANSLATION_OLLAMA_MODEL`, `AI_TRANSLATION_OLLAMA_URL`, `AI_TRANSLATION_OLLAMA_BATCH_SIZE`, `AI_TRANSLATION_OLLAMA_TIMEOUT_MS`, `AI_TRANSLATION_OLLAMA_THINK`로 조정할 수 있습니다. 번역 요청은 기본적으로 Qwen의 추가 추론을 끄고 토큰 한도와 문맥 창을 줄여 응답 시간을 관리합니다. 추가 추론이 필요하면 `AI_TRANSLATION_OLLAMA_THINK=true`로 켤 수 있습니다.
 
 자동 역식은 검출기의 글자 마스크를 획보다 넓혀 원문을 지우고, 확신도 높은 말풍선 안에서는 OCR 상자도 함께 지운 뒤 LaMa가 복원합니다. 말풍선 후보가 OCR 글자 영역보다 지나치게 크면 버려 이웃 말풍선까지 번역문이 뻗지 않게 합니다. 불확실한 영역에서는 획 마스크만 사용해 화면의 큰 부분이 네모나게 지워지지 않게 합니다. LaMa는 원본 해상도의 겹치는 512px 타일에서 복원하고, 대사·나레이션은 진한 글자색으로 외곽선 없이 식자합니다. 마스크 여백은 `INPAINT_PADDING`으로 조절합니다.
 

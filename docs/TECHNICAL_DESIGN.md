@@ -86,6 +86,9 @@ Tag
 SeriesTag
   series_id, tag_id
 
+SeriesTerm
+  series_id, source_term, source_reading, target_term, aliases, kind, notes
+
 Chapter
   id, series_id, number_label, sort_key, title
   source_asset_id, page_count, processing_status

@@ -26,6 +26,7 @@ async function boot() {
   $('#chapter-dialog').addEventListener('cancel', () => $('#chapter-form').reset());
   $('#series-detail-close').addEventListener('click', () => $('#series-detail-dialog').close());
   $('#series-delete').addEventListener('click', () => state.detailSeriesId && deleteSeries(state.detailSeriesId, $('#series-detail-title').textContent));
+  $('#glossary-form').addEventListener('submit', saveGlossaryTerm);
   $('#reader-close').addEventListener('click', () => $('#reader-dialog').close());
   $('#reader-original').addEventListener('click', () => setReaderMode('original'));
   $('#reader-translated').addEventListener('click', () => setReaderMode('translated'));
@@ -90,6 +91,7 @@ async function openSeries(id) {
   $('#series-detail-description').textContent = series.description || '작품 설명이 없습니다.';
   $('#series-detail-tags').innerHTML = series.tags ? series.tags.split(', ').map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join('') : '';
   $('#series-detail-count').textContent = `${series.chapters.length}개`;
+  renderSeriesGlossary(series.glossary || []);
   $('#chapter-list').innerHTML = series.chapters.length ? series.chapters.map(renderChapter).join('') : '<p class="muted">등록된 권이 없습니다.</p>';
   if (!$('#series-detail-dialog').open) $('#series-detail-dialog').showModal();
   $('#series-delete').dataset.seriesId = series.id;
@@ -100,7 +102,48 @@ async function openSeries(id) {
   document.querySelectorAll('[data-ocr]').forEach((button) => button.addEventListener('click', () => startOcr(button.dataset.ocr)));
   document.querySelectorAll('[data-reprocess-ocr]').forEach((button) => button.addEventListener('click', () => startOcr(button.dataset.reprocessOcr, { replaceExisting: true })));
   document.querySelectorAll('[data-auto-translate]').forEach((button) => button.addEventListener('click', () => startAutoTranslate(button.dataset.autoTranslate)));
+  document.querySelectorAll('[data-delete-glossary]').forEach((button) => button.addEventListener('click', () => deleteGlossaryTerm(button.dataset.deleteGlossary)));
   series.chapters.filter((chapter) => ['queued', 'running'].includes(chapter.job_status)).forEach((chapter) => watchJob(chapter.job_id));
+}
+
+function renderSeriesGlossary(terms) {
+  $('#series-glossary-count').textContent = `${terms.length}개`;
+  $('#series-glossary-list').innerHTML = terms.length ? terms.map((term) => {
+    const kind = ({ person: '인물', place: '장소', organization: '단체', series_term: '작품 용어' })[term.kind] || '작품 용어';
+    const aliases = Array.isArray(term.aliases) && term.aliases.length ? ` · 별칭 ${escapeHtml(term.aliases.join(', '))}` : '';
+    const reading = term.source_reading ? ` · ${escapeHtml(term.source_reading)}` : '';
+    const notes = term.notes ? `<p class="muted">${escapeHtml(term.notes)}</p>` : '';
+    return `<article class="glossary-item"><div><strong>${escapeHtml(term.source_term)}</strong><span class="muted">${reading} → ${escapeHtml(term.target_term)} · ${kind}${aliases}</span>${notes}</div><button class="button small ghost" type="button" data-delete-glossary="${term.id}">삭제</button></article>`;
+  }).join('') : '<p class="muted">등록한 용어가 없습니다.</p>';
+}
+
+async function saveGlossaryTerm(event) {
+  event.preventDefault();
+  if (!state.detailSeriesId) return;
+  const aliases = $('#glossary-aliases').value.split(/[,\n]/u).map((value) => value.trim()).filter(Boolean);
+  const result = await request(`/api/series/${state.detailSeriesId}/glossary`, {
+    method: 'PUT',
+    body: {
+      sourceTerm: $('#glossary-source').value,
+      sourceReading: $('#glossary-reading').value,
+      targetTerm: $('#glossary-target').value,
+      kind: $('#glossary-kind').value,
+      aliases,
+      notes: $('#glossary-notes').value,
+    },
+  });
+  if (!result?.id) return;
+  $('#glossary-form').reset();
+  await openSeries(state.detailSeriesId);
+  showNotice('작품 용어집을 저장했습니다. 다음 번역부터 적용됩니다.');
+}
+
+async function deleteGlossaryTerm(termId) {
+  if (!state.detailSeriesId || !window.confirm('이 작품 용어집 항목을 삭제할까요?')) return;
+  const result = await request(`/api/series/${state.detailSeriesId}/glossary/${termId}`, { method: 'DELETE' });
+  if (!result?.deleted) return;
+  await openSeries(state.detailSeriesId);
+  showNotice('작품 용어집 항목을 삭제했습니다.');
 }
 
 function renderChapter(chapter) {
@@ -302,25 +345,69 @@ function renderTranslationEditor() {
   $('#translation-editor-count').textContent = `${entries.length}개 블록`;
   $('#translation-editor-list').innerHTML = entries.length ? entries.map(({ page, pageIndex, block }) => {
     const layer = (page.lettering_layers || []).find((candidate) => candidate.translation_id === block.translation?.id);
-    const style = layer?.style || {};
+    const kind = ['dialogue', 'caption', 'sound_effect'].includes(block.translation?.content_kind)
+      ? block.translation.content_kind
+      : layer?.style?.soundEffect ? 'sound_effect' : 'dialogue';
+    const profile = state.reader.chapter.lettering_style_profiles?.[kind] || {};
+    const style = layer?.style || profile;
     const defaultWritingMode = /^(?:ko|kor)(?:[-_]|$)/i.test(state.reader.chapter.target_language || '') ? 'horizontal-tb' : 'vertical-rl';
     const writingMode = ['vertical-rl', 'horizontal-tb'].includes(style.writingMode) ? style.writingMode : defaultWritingMode;
-    return `<article class="translation-entry"><div class="translation-source"><span class="eyebrow">PAGE ${pageIndex + 1}</span><p>${escapeHtml(block.source_text)}</p><span class="muted">신뢰도 ${block.confidence == null ? '-' : `${Math.round(block.confidence * 100)}%`}</span></div><textarea data-translation-text="${block.id}" rows="2" placeholder="번역문을 입력하세요.">${escapeHtml(block.translation?.translated_text || '')}</textarea><div class="translation-controls"><select data-writing-mode="${block.id}" aria-label="쓰기 방향"><option value="vertical-rl" ${writingMode !== 'horizontal-tb' ? 'selected' : ''}>세로쓰기</option><option value="horizontal-tb" ${writingMode === 'horizontal-tb' ? 'selected' : ''}>가로쓰기</option></select><input data-font-size="${block.id}" type="number" min="8" max="96" value="${Number(style.fontSize) || 24}" aria-label="글자 크기" /><span class="muted">px</span><button class="button small primary" data-save-translation="${block.id}">저장</button></div></article>`;
+    const color = /^#[0-9a-f]{6}$/i.test(String(style.color || '')) ? style.color : '#21121a';
+    const channels = color.match(/[0-9a-f]{2}/gi).map((channel) => Number.parseInt(channel, 16));
+    const luminance = (channels[0] * 299 + channels[1] * 587 + channels[2] * 114) / 1000;
+    const outlineColor = /^#[0-9a-f]{6}$/i.test(String(style.outlineColor || ''))
+      ? style.outlineColor
+      : luminance >= 145 ? '#19121b' : '#ffffff';
+    const alignment = ['center', 'left', 'right'].includes(style.textAlign) ? style.textAlign : 'center';
+    const weight = ['400', '600', '700'].includes(String(style.fontWeight)) ? String(style.fontWeight) : '600';
+    return `<article class="translation-entry"><div class="translation-source"><span class="eyebrow">PAGE ${pageIndex + 1}</span><p>${escapeHtml(block.source_text)}</p><span class="muted">신뢰도 ${block.confidence == null ? '-' : `${Math.round(block.confidence * 100)}%`}</span></div><textarea data-translation-text="${block.id}" rows="2" placeholder="번역문을 입력하세요.">${escapeHtml(block.translation?.translated_text || '')}</textarea><div class="translation-controls"><select data-style-field="contentKind" data-block-id="${block.id}" aria-label="문자 유형"><option value="dialogue" ${kind === 'dialogue' ? 'selected' : ''}>대사</option><option value="caption" ${kind === 'caption' ? 'selected' : ''}>나레이션</option><option value="sound_effect" ${kind === 'sound_effect' ? 'selected' : ''}>효과음</option></select><select data-style-field="writingMode" data-block-id="${block.id}" aria-label="쓰기 방향"><option value="vertical-rl" ${writingMode !== 'horizontal-tb' ? 'selected' : ''}>세로쓰기</option><option value="horizontal-tb" ${writingMode === 'horizontal-tb' ? 'selected' : ''}>가로쓰기</option></select><input data-style-field="fontSize" data-block-id="${block.id}" type="number" min="8" max="96" value="${Number(style.fontSize) || 24}" aria-label="글자 크기" /><span class="muted">px</span><label class="muted">글자색 <input data-style-field="color" data-block-id="${block.id}" type="color" value="${color}" aria-label="글자 색" /></label><select data-style-field="fontWeight" data-block-id="${block.id}" aria-label="글자 굵기"><option value="400" ${weight === '400' ? 'selected' : ''}>보통</option><option value="600" ${weight === '600' ? 'selected' : ''}>중간</option><option value="700" ${weight === '700' ? 'selected' : ''}>굵게</option></select><select data-style-field="textAlign" data-block-id="${block.id}" aria-label="정렬"><option value="center" ${alignment === 'center' ? 'selected' : ''}>가운데</option><option value="left" ${alignment === 'left' ? 'selected' : ''}>왼쪽</option><option value="right" ${alignment === 'right' ? 'selected' : ''}>오른쪽</option></select><label class="muted">외곽선 <input data-style-field="outlineWidth" data-block-id="${block.id}" type="number" min="0" max="6" step="0.2" value="${Number.isFinite(Number(style.outlineWidth)) ? Number(style.outlineWidth) : 1.4}" aria-label="외곽선 두께" /></label><label class="muted">외곽선색 <input data-style-field="outlineColor" data-block-id="${block.id}" type="color" value="${outlineColor}" aria-label="외곽선 색" /></label><label class="muted">기울기 <input data-style-field="rotation" data-block-id="${block.id}" type="number" min="-45" max="45" value="${Number(style.rotation) || 0}" aria-label="기울기" />°</label><button class="button small primary" data-save-translation="${block.id}">번역 저장</button><button class="button small" data-save-lettering-profile="${block.id}">이 유형을 작품 기본값으로</button></div></article>`;
   }).join('') : '<p class="muted">OCR 블록이 없습니다. 먼저 OCR을 실행해 주세요.</p>';
   document.querySelectorAll('[data-save-translation]').forEach((button) => button.addEventListener('click', () => saveTranslation(button.dataset.saveTranslation)));
+  document.querySelectorAll('[data-save-lettering-profile]').forEach((button) => button.addEventListener('click', () => saveLetteringProfile(button.dataset.saveLetteringProfile)));
 }
 
 async function saveTranslation(blockId) {
   const text = document.querySelector(`[data-translation-text="${blockId}"]`).value.trim();
-  const writingMode = document.querySelector(`[data-writing-mode="${blockId}"]`).value;
-  const fontSize = Number(document.querySelector(`[data-font-size="${blockId}"]`).value);
-  const result = await request(`/api/ocr-blocks/${blockId}/translations`, { method: 'POST', body: { translatedText: text, targetLanguage: state.reader.chapter.target_language, style: { writingMode, fontSize } } });
+  const style = readLetteringStyle(blockId);
+  const result = await request(`/api/ocr-blocks/${blockId}/translations`, { method: 'POST', body: { translatedText: text, targetLanguage: state.reader.chapter.target_language, contentKind: style.contentKind, style } });
   if (!result) return;
   state.reader.chapter = await request(`/api/chapters/${state.reader.chapter.id}`);
   renderReader();
   $('#translation-editor').hidden = false;
   $('#reader-editor-toggle').classList.add('active');
   showNotice('번역과 식자 레이어를 저장했습니다.');
+}
+
+async function saveLetteringProfile(blockId) {
+  const style = readLetteringStyle(blockId);
+  const { contentKind, ...profile } = style;
+  const result = await request(`/api/series/${state.reader.chapter.series_id}/lettering-style-profiles/${contentKind}`, {
+    method: 'PUT',
+    body: { style: profile },
+  });
+  if (!result) return;
+  state.reader.chapter = await request(`/api/chapters/${state.reader.chapter.id}`);
+  const editor = $('#translation-editor');
+  editor.hidden = false;
+  renderReader();
+  editor.hidden = false;
+  $('#reader-editor-toggle').classList.add('active');
+  showNotice('이 작품의 해당 유형 기본값으로 저장했습니다. 다음 자동 식자부터 적용됩니다.');
+}
+
+function readLetteringStyle(blockId) {
+  const read = (field) => document.querySelector(`[data-style-field="${field}"][data-block-id="${blockId}"]`).value;
+  return {
+    contentKind: read('contentKind'),
+    writingMode: read('writingMode'),
+    fontSize: Number(read('fontSize')),
+    color: read('color'),
+    outlineColor: read('outlineColor'),
+    fontWeight: read('fontWeight'),
+    textAlign: read('textAlign'),
+    outlineWidth: Number(read('outlineWidth')),
+    rotation: Number(read('rotation')),
+  };
 }
 
 async function renderReaderImages() {
@@ -373,9 +460,7 @@ async function uploadChapter(event) {
     event.target.reset();
     await loadSeries($('#search').value);
     if (jobId) {
-      const job = await request(`/api/jobs/${jobId}`);
-      if (job) showProcessingDialog(job);
-      watchJob(jobId, { showDialog: true });
+      watchJob(jobId);
     } else {
       showNotice('업로드를 접수했습니다.');
     }

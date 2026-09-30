@@ -1,7 +1,10 @@
 const KOREAN_LANGUAGE = /^(?:ko|kor)(?:[-_]|$)/i;
 const HANGUL = /[\uac00-\ud7af]/g;
 const HAS_HANGUL = /[\uac00-\ud7af]/;
-const MAX_BALLOON_AREA_RATIO = 4;
+// OCR polygons cover glyphs, not the whole balloon. Korean rewrites need more
+// room than the original Japanese lettering, so permit safely detected boxes
+// that are several times larger than the source text bounds.
+const MAX_BALLOON_AREA_RATIO = 10;
 
 export function autoLetteringStyle(block, translatedText = '', targetLanguage = '', contentKind = '') {
   const polygon = parsePolygon(block?.polygon_json);
@@ -38,7 +41,7 @@ export function autoLetteringStyle(block, translatedText = '', targetLanguage = 
     : sourceVertical || height > width * 1.25 ? 'vertical-rl' : 'horizontal-tb';
   const sourceColor = String(layout.foregroundColor || '');
   const sourceRotation = Number(layout.rotation);
-  const color = soundEffect && /^#[0-9a-f]{6}$/i.test(sourceColor) ? sourceColor : '#21121a';
+  const color = /^#[0-9a-f]{6}$/i.test(sourceColor) ? sourceColor : '#21121a';
 
   return {
     color,
@@ -47,11 +50,17 @@ export function autoLetteringStyle(block, translatedText = '', targetLanguage = 
     writingMode,
     fontSize: Math.round(Math.min(32, estimateFontSize(block, text, fitBox.width, fitBox.height) * (soundEffect ? 1.12 : 1))),
     fontWeight: soundEffect ? '700' : '600',
-    outlineWidth: colorLuminance(color) >= 210 ? 0 : soundEffect ? 2.6 : 0,
+    outlineWidth: soundEffect ? 2.6 : colorLuminance(color) >= 145 ? 1.1 : 0,
     rotation: soundEffect && Number.isFinite(sourceRotation) ? Math.min(45, Math.max(-45, sourceRotation)) : 0,
     balanceLines: korean,
     soundEffect,
   };
+}
+
+export function inferLetteringContentKind(block, preferredKind = '') {
+  const preferred = String(preferredKind || '').trim().toLowerCase();
+  if (['dialogue', 'caption', 'sound_effect'].includes(preferred)) return preferred;
+  return looksLikeJapaneseSoundEffect(block?.source_text) ? 'sound_effect' : 'dialogue';
 }
 
 function polygonDimensions(points) {

@@ -92,6 +92,18 @@ dialog::backdrop { background: #08070cb8; backdrop-filter: blur(3px); }
 .detail-card h2 { margin: 5px 0 0; }
 .section-heading { display: flex; align-items: baseline; justify-content: space-between; margin-top: 28px; border-bottom: 1px solid var(--border); }
 .section-heading h3 { margin: 0 0 10px; }
+.series-glossary { margin-top: 24px; padding: 0 14px 14px; border: 1px solid var(--border); border-radius: 13px; background: #101a29; }
+.series-glossary > p { margin: 9px 0; font-size: 13px; }
+.glossary-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 10px; align-items: end; }
+.glossary-form label { min-width: 0; margin: 8px 0; font-size: 12px; }
+.glossary-form input, .glossary-form select { margin-top: 4px; padding: 9px 10px; }
+.glossary-form button { margin: 8px 0; }
+.series-glossary-list { display: grid; }
+.glossary-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 1px solid #26364e; }
+.glossary-item > div { min-width: 0; }
+.glossary-item strong, .glossary-item span { margin-right: 7px; }
+.glossary-item .muted { font-size: 12px; overflow-wrap: anywhere; }
+.glossary-item p { margin: 3px 0 0; }
 .chapter-list { display: grid; gap: 8px; margin-top: 12px; }
 .chapter-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 0; border-bottom: 1px solid #26364e; }
 .chapter-row strong, .chapter-row .muted { display: block; }
@@ -122,6 +134,8 @@ dialog::backdrop { background: #08070cb8; backdrop-filter: blur(3px); }
 .translation-controls { grid-column: 2; justify-content: flex-end; }
 .translation-controls select, .translation-controls input { width: auto; padding: 7px 8px; }
 .translation-controls input { max-width: 76px; }
+.translation-controls input[type="color"] { width: 30px; height: 30px; padding: 2px; }
+.translation-controls label { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .translation-controls .muted { font-size: 12px; }
 .reader-stage { flex: 1; min-height: 0; overflow: auto; padding: 12px 10px 25px; background: #0a111d; border: 1px solid #202f45; border-radius: 12px; }
 .reader-page { width: min(100%, 760px); margin: 0 auto 18px; }
@@ -166,6 +180,7 @@ dialog::backdrop { background: #08070cb8; backdrop-filter: blur(3px); }
   .toolbar { align-items: stretch; flex-direction: column; gap: 10px; }
   .toolbar input { max-width: none; }
   .series-grid { grid-template-columns: 1fr; gap: 12px; }
+  .glossary-form { grid-template-columns: 1fr 1fr; }
   .series-card { min-height: 0; padding: 18px; }
   .series-meta { margin-top: 18px; }
   .card-actions { flex-wrap: wrap; }

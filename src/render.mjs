@@ -21,7 +21,7 @@ export async function renderTranslatedPage(sourcePath, layers, {
   const context = output.getContext('2d');
   context.drawImage(image, 0, 0, width, height);
 
-  const safeLayers = layers.filter((layer) => getBounds(layer.polygon_json || layer.polygon, width, height));
+  const safeLayers = layers.filter(isRenderableLetteringLayer);
   if (!skipInpaint) {
     const imageData = context.getImageData(0, 0, width, height);
     const maskImage = createMaskCanvas(width, height, safeLayers, inpaintPadding, imageData.data);
@@ -42,7 +42,24 @@ export async function createInpaintMask(sourcePath, layers, { inpaintPadding = 0
   const sourceContext = sourceCanvas.getContext('2d');
   sourceContext.drawImage(image, 0, 0, image.width, image.height);
   const imagePixels = sourceContext.getImageData(0, 0, image.width, image.height).data;
-  return createMaskCanvas(image.width, image.height, layers, inpaintPadding, imagePixels).toBuffer('image/png');
+  const safeLayers = layers.filter(isRenderableLetteringLayer);
+  return createMaskCanvas(image.width, image.height, safeLayers, inpaintPadding, imagePixels).toBuffer('image/png');
+}
+
+export function isRenderableLetteringLayer(layer) {
+  if (!String(layer?.text || '').trim()) return false;
+  const value = layer.polygon_json || layer.polygon;
+  const polygon = typeof value === 'string' ? parseJson(value, []) : value;
+  if (!Array.isArray(polygon) || polygon.length < 3) return false;
+  const points = polygon.map((point) => ({
+    x: Number(Array.isArray(point) ? point[0] : point?.x),
+    y: Number(Array.isArray(point) ? point[1] : point?.y),
+  }));
+  if (points.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y)
+    || point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1)) return false;
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  return Math.max(...xs) > Math.min(...xs) && Math.max(...ys) > Math.min(...ys);
 }
 
 function createMaskCanvas(width, height, layers, padding, imagePixels = null) {
@@ -115,7 +132,7 @@ function hasConfidentBalloonBox(layer, sourcePolygon) {
     : layer.source_layout_hint_json || {};
   const sourceArea = polygonBoundsArea(sourcePolygon);
   const balloonArea = polygonBoundsArea(layout.letteringPolygon);
-  return sourceArea > 0 && balloonArea > 0 && balloonArea <= sourceArea * 4;
+  return sourceArea > 0 && balloonArea > 0 && balloonArea <= sourceArea * 10;
 }
 
 function hasLightUniformBackground(sourcePolygon, glyphPolygons, width, height, pixels) {
@@ -154,7 +171,9 @@ function hasLightUniformBackground(sourcePolygon, glyphPolygons, width, height, 
   if (count < 12) return false;
   const mean = sum / count;
   const deviation = Math.sqrt(Math.max(0, sumSquares / count - mean * mean));
-  return mean >= 245 && deviation <= 38 && bright / count >= 0.92;
+  // Manga balloon interiors often contain halftone and antialiasing. A strict
+  // near-white cutoff leaves original glyph fragments behind after inpainting.
+  return mean >= 238 && deviation <= 45 && bright / count >= 0.82;
 }
 
 function pointInPolygon(x, y, polygon) {
@@ -262,20 +281,24 @@ function drawHorizontalText(context, value, bounds, style, fontFamily, baseFontS
   const inset = Math.max(1, Math.min(bounds.width, bounds.height) * 0.08);
   const maxWidth = Math.max(1, bounds.width - inset * 2);
   const maxHeight = Math.max(1, bounds.height - inset * 2);
+  const minimumFontSize = 7;
   let fontSize = baseFontSize;
   let lines = [' '];
-  while (fontSize > 4) {
+  while (fontSize > minimumFontSize) {
     context.font = `${style.fontWeight} ${fontSize}px "${fontFamily}", sans-serif`;
     lines = style.balanceLines
       ? wrapTextBalanced(context, String(value || ''), maxWidth)
       : wrapText(context, String(value || ''), maxWidth);
     if (lines.length * fontSize * 1.1 <= maxHeight && lines.every((line) => context.measureText(line).width <= maxWidth)) break;
-    fontSize = Math.max(4, fontSize - 1);
+    fontSize = Math.max(minimumFontSize, fontSize - 1);
   }
   context.font = `${style.fontWeight} ${fontSize}px "${fontFamily}", sans-serif`;
   lines = style.balanceLines
     ? wrapTextBalanced(context, String(value || ''), maxWidth)
     : wrapText(context, String(value || ''), maxWidth);
+  if (lines.length * fontSize * 1.1 > maxHeight || lines.some((line) => context.measureText(line).width > maxWidth)) {
+    throw new Error('식자 영역이 좁아 글자를 읽을 크기로 배치할 수 없습니다. 말풍선 영역이나 문구를 조정해 주세요.');
+  }
   const lineHeight = fontSize * 1.1;
   const totalHeight = lines.length * lineHeight;
   const firstY = bounds.top + (bounds.height - totalHeight) / 2 + lineHeight / 2;
@@ -295,16 +318,21 @@ function drawVerticalText(context, value, bounds, style, fontFamily, baseFontSiz
   const maxWidth = Math.max(1, bounds.width - inset * 2);
   const maxHeight = Math.max(1, bounds.height - inset * 2);
   const characters = Array.from(String(value || '').replaceAll('\n', ''));
+  const minimumFontSize = 7;
   let fontSize = baseFontSize;
   let rows = 1;
   let columns = Math.max(1, characters.length);
-  while (fontSize > 4) {
+  while (fontSize > minimumFontSize) {
     rows = Math.max(1, Math.floor(maxHeight / (fontSize * 1.1)));
     columns = Math.max(1, Math.ceil(characters.length / rows));
     if (columns * fontSize * 1.15 <= maxWidth) break;
-    fontSize = Math.max(4, fontSize - 1);
+    fontSize = Math.max(minimumFontSize, fontSize - 1);
   }
   rows = Math.max(1, Math.floor(maxHeight / (fontSize * 1.1)));
+  columns = Math.max(1, Math.ceil(characters.length / rows));
+  if (fontSize * 1.1 > maxHeight || columns * fontSize * 1.15 > maxWidth) {
+    throw new Error('식자 영역이 좁아 글자를 읽을 크기로 배치할 수 없습니다. 말풍선 영역이나 문구를 조정해 주세요.');
+  }
   context.font = `${style.fontWeight} ${fontSize}px "${fontFamily}", sans-serif`;
   const lineHeight = fontSize * 1.1;
   const columnWidth = fontSize * 1.15;
@@ -324,9 +352,7 @@ function drawTextWithOutline(context, text, x, y, color, fontSize, style = {}) {
   const blue = Number.parseInt(hex.slice(4, 6), 16);
   const luminance = (red * 299 + green * 587 + blue * 114) / 1000;
   const requestedOutlineWidth = Number(style.outlineWidth);
-  const outlineWidth = luminance >= 210
-    ? 0
-    : Number.isFinite(requestedOutlineWidth)
+  const outlineWidth = Number.isFinite(requestedOutlineWidth)
     ? Math.min(6, Math.max(0, requestedOutlineWidth))
     : Math.min(2, fontSize * 0.07);
   if (outlineWidth > 0) {

@@ -99,6 +99,20 @@
         <div class="dialog-header"><div><p class="eyebrow">SERIES</p><h2 id="series-detail-title"></h2></div><div class="dialog-header-actions"><button id="series-delete" class="button small danger" type="button">작품 삭제</button><button id="series-detail-close" class="icon-button" type="button" aria-label="닫기">×</button></div></div>
         <p id="series-detail-description" class="muted"></p>
         <div id="series-detail-tags"></div>
+        <section class="series-glossary">
+          <div class="section-heading"><h3>작품 용어집</h3><span id="series-glossary-count" class="muted"></span></div>
+          <p class="muted">인명과 고유명사의 원문, 읽는 법, 번역 표기를 등록하면 이 작품의 번역에 우선 적용합니다. 같은 원문 표기를 다시 저장하면 기존 항목을 갱신합니다.</p>
+          <form id="glossary-form" class="glossary-form">
+            <label>원문 표기<input id="glossary-source" maxlength="100" required placeholder="例: 星野ユウ" /></label>
+            <label>읽는 법<input id="glossary-reading" maxlength="100" placeholder="ほしの ゆう" /></label>
+            <label>번역 표기<input id="glossary-target" maxlength="100" required placeholder="호시노 유" /></label>
+            <label>분류<select id="glossary-kind"><option value="person">인물</option><option value="place">장소</option><option value="organization">단체</option><option value="series_term">작품 용어</option></select></label>
+            <label>별칭<input id="glossary-aliases" maxlength="500" placeholder="다른 표기 (쉼표로 구분)" /></label>
+            <label>메모<input id="glossary-notes" maxlength="500" placeholder="관계, 호칭 등 번역 참고사항" /></label>
+            <button class="button small primary" type="submit">용어 저장</button>
+          </form>
+          <div id="series-glossary-list" class="series-glossary-list"></div>
+        </section>
         <div class="section-heading"><h3>권 목록</h3><span id="series-detail-count" class="muted"></span></div>
         <div id="chapter-list" class="chapter-list"></div>
       </div>
