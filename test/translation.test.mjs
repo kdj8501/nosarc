@@ -18,6 +18,7 @@ test('Ollama translates one line at a time and passes nearby original dialogue o
   ];
   const results = await translateWithOllama(blocks, {
     skipNaturalization: true,
+    think: true,
     fetchImpl: async (_url, options) => {
       const body = JSON.parse(options.body);
       requests.push(body);

@@ -86,6 +86,7 @@ class ComicTextDetector:
                 "rotation": float(block.angle),
                 "textLineCount": len(block.lines),
                 "foregroundColor": _estimate_ink_color(image, mask, block.lines, width, height),
+                "backgroundLuminance": _estimate_background_luminance(image, (x1, y1, x2, y2)),
             })
         return results
 
@@ -338,3 +339,22 @@ def _estimate_ink_color(image: np.ndarray, mask: np.ndarray, lines: list, width:
     dominant_pixels = pixels[np.all(quantized == dominant, axis=1)]
     blue, green, red = np.median(dominant_pixels, axis=0).astype(np.uint8)
     return f"#{int(red):02x}{int(green):02x}{int(blue):02x}"
+
+
+def _estimate_background_luminance(
+    image: np.ndarray,
+    bounds: tuple[int, int, int, int],
+) -> float | None:
+    """Estimate the local paper or panel tone to choose legible replacement ink."""
+    height, width = image.shape[:2]
+    left, top, right, bottom = bounds
+    left = max(0, min(width, int(left)))
+    right = max(0, min(width, int(right)))
+    top = max(0, min(height, int(top)))
+    bottom = max(0, min(height, int(bottom)))
+    if right - left < 4 or bottom - top < 4:
+        return None
+    region = cv2.cvtColor(image[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
+    if region.size < 16:
+        return None
+    return float(np.median(region))

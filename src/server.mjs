@@ -22,7 +22,7 @@ import {
 } from './security.mjs';
 import { createOcrWorker, extractOcrBlocks, recognizePage } from './ocr.mjs';
 import { createInpaintMask, isRenderableLetteringLayer, renderTranslatedPage } from './render.mjs';
-import { autoLetteringStyle, inferLetteringContentKind } from './lettering.mjs';
+import { autoLetteringStyle, automaticLetteringPolygon, inferLetteringContentKind } from './lettering.mjs';
 import { isKoreanTargetLanguage, isKoreanText, translateWithOllama } from './translation.mjs';
 
 globalThis.DOMMatrix = canvas.DOMMatrix;
@@ -36,7 +36,7 @@ const { createCanvas } = canvas;
 const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const LETTERING_LAYOUT_VERSION = 'balloon-interior-v2';
+const LETTERING_LAYOUT_VERSION = 'balloon-interior-v3';
 loadDotEnv(path.join(ROOT, '.env'));
 const venvPythonPath = path.join(ROOT, 'ai-worker', '.venv', process.platform === 'win32' ? 'Scripts' : 'bin', process.platform === 'win32' ? 'python.exe' : 'python');
 const configuredWorkerCommand = String(process.env.AI_WORKER_COMMAND || '').trim();
@@ -701,7 +701,7 @@ app.post('/api/ocr-blocks/:id/translations', async (req, res) => {
       now,
     );
     db.prepare(`INSERT INTO lettering_layers (id, page_id, translation_id, polygon_json, text, style_json, is_active, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(layerId, block.page_id, translationId, JSON.stringify(getAutomaticLetteringPolygon(block)), translatedText, JSON.stringify(style), now, now);
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(layerId, block.page_id, translationId, JSON.stringify(automaticLetteringPolygon(block)), translatedText, JSON.stringify(style), now, now);
   });
   create();
   await clearRenderedPage(block.page_id);
@@ -1474,7 +1474,7 @@ async function runAutoTranslationJob(jobId) {
           layerId,
           block.page_id,
           translationId,
-          JSON.stringify(getAutomaticLetteringPolygon(block)),
+          JSON.stringify(automaticLetteringPolygon(block)),
           translatedText,
           JSON.stringify(applyLetteringStyleProfile(
             autoLetteringStyle(block, translatedText, chapter.target_language || 'ko', contentKind),
@@ -1724,6 +1724,7 @@ async function runComicTextDetectorWorker(jobId, pages, onProgress) {
           rotation: Number.isFinite(Number(event.rotation)) ? Math.min(45, Math.max(-45, Number(event.rotation))) : 0,
           textLineCount: Number.isFinite(Number(event.textLineCount)) ? Math.max(1, Math.round(Number(event.textLineCount))) : 1,
           foregroundColor: /^#[0-9a-f]{6}$/i.test(String(event.foregroundColor || '')) ? String(event.foregroundColor) : '#21121a',
+          backgroundLuminance: event.backgroundLuminance != null && Number.isFinite(Number(event.backgroundLuminance)) ? Math.min(255, Math.max(0, Number(event.backgroundLuminance))) : null,
           letteringPolygon: normalizeOptionalPolygon(event.letteringPolygon),
         },
         sourceText: '',
@@ -1880,16 +1881,6 @@ function normalizeOptionalPolygon(value) {
   } catch {
     return null;
   }
-}
-
-function getAutomaticLetteringPolygon(block) {
-  const layoutHint = parseJson(block?.layout_hint_json, {});
-  const sourcePolygon = parseJson(block?.polygon_json, []);
-  const candidate = normalizeOptionalPolygon(layoutHint.letteringPolygon);
-  const sourceBounds = getNormalizedPolygonBounds(sourcePolygon);
-  const candidateBounds = getNormalizedPolygonBounds(candidate);
-  if (candidate && sourceBounds?.area > 0 && candidateBounds?.area <= sourceBounds.area * 10) return candidate;
-  return sourcePolygon;
 }
 
 async function runLamaInpaintWorker(jobId, pages, onProgress) {

@@ -1,10 +1,12 @@
 const KOREAN_LANGUAGE = /^(?:ko|kor)(?:[-_]|$)/i;
 const HANGUL = /[\uac00-\ud7af]/g;
 const HAS_HANGUL = /[\uac00-\ud7af]/;
-// OCR polygons cover glyphs, not the whole balloon. Korean rewrites need more
-// room than the original Japanese lettering, so permit safely detected boxes
-// that are several times larger than the source text bounds.
-const MAX_BALLOON_AREA_RATIO = 10;
+// Korean rewrites need extra space, but loose balloon boxes can overlap art.
+// Keep the automatically selected expansion modest and bounded on each axis.
+const MAX_BALLOON_AREA_RATIO = 2.5;
+const MAX_BALLOON_WIDTH_RATIO = 1.8;
+const MAX_BALLOON_HEIGHT_RATIO = 1.6;
+const MAX_BRIGHT_BALLOON_AREA_RATIO = 5;
 
 export function autoLetteringStyle(block, translatedText = '', targetLanguage = '', contentKind = '') {
   const polygon = parsePolygon(block?.polygon_json);
@@ -13,7 +15,6 @@ export function autoLetteringStyle(block, translatedText = '', targetLanguage = 
   const language = String(targetLanguage || '').trim();
   const text = String(translatedText || '').trim();
   const korean = KOREAN_LANGUAGE.test(language) || HAS_HANGUL.test(text);
-  const hangulCount = (text.match(HANGUL) || []).length;
   const soundEffect = contentKind === 'sound_effect'
     || (contentKind !== 'dialogue' && contentKind !== 'caption' && looksLikeJapaneseSoundEffect(block?.source_text));
 
@@ -21,12 +22,12 @@ export function autoLetteringStyle(block, translatedText = '', targetLanguage = 
   const balloonPoints = parsePolygon(layout.letteringPolygon)
     .filter((point) => Number.isFinite(Number(point?.x)) && Number.isFinite(Number(point?.y)));
   const balloonBox = polygonDimensions(balloonPoints);
+  const useBalloonBox = !soundEffect && isPlausibleBalloonBox(sourceBox, balloonBox);
   const sourceArea = sourceBox.width * sourceBox.height;
   const balloonArea = balloonBox.width * balloonBox.height;
-  const useBalloonBox = !soundEffect
-    && balloonPoints.length >= 3
+  const hasBrightBalloonCandidate = balloonPoints.length >= 3
     && sourceArea > 0
-    && balloonArea <= sourceArea * MAX_BALLOON_AREA_RATIO;
+    && balloonArea <= sourceArea * MAX_BRIGHT_BALLOON_AREA_RATIO;
   const fitBox = useBalloonBox ? balloonBox : sourceBox;
   const width = sourceBox.width;
   const height = sourceBox.height;
@@ -36,30 +37,62 @@ export function autoLetteringStyle(block, translatedText = '', targetLanguage = 
     ? (height * (pageHeight > 0 ? pageHeight : 1)) / (width * (pageWidth > 0 ? pageWidth : 1))
     : 0;
 
-  // Use horizontal Korean for ordinary dialogue, but keep short labels and
-  // captions vertical when their original region is a narrow Japanese column.
-  const shortVerticalText = korean && regionAspectRatio > 2.4 && hangulCount > 0 && hangulCount <= 6;
+  // Use horizontal Korean in ordinary bubbles, but keep narrow, tall source
+  // columns vertical so one glyph per line does not make long text unreadable.
   const sourceVertical = layout.vertical === true;
-  const preserveVertical = (soundEffect && sourceVertical) || (sourceVertical && shortVerticalText);
+  const preserveVertical = sourceVertical && (soundEffect || (korean && regionAspectRatio > 2.4));
   const writingMode = korean
     ? preserveVertical ? 'vertical-rl' : 'horizontal-tb'
     : sourceVertical || regionAspectRatio > 1.25 ? 'vertical-rl' : 'horizontal-tb';
   const sourceColor = String(layout.foregroundColor || '');
   const sourceRotation = Number(layout.rotation);
-  const color = /^#[0-9a-f]{6}$/i.test(sourceColor) ? sourceColor : '#21121a';
+  // The detector can mistake bright pixels inside its text mask for the ink
+  // color. A confidently enclosed white balloon should use readable dark ink.
+  const sourceColorIsBright = /^#[0-9a-f]{6}$/i.test(sourceColor) && colorLuminance(sourceColor) >= 210;
+  const backgroundLuminance = layout.backgroundLuminance == null ? Number.NaN : Number(layout.backgroundLuminance);
+  const hasBackgroundEstimate = Number.isFinite(backgroundLuminance) && backgroundLuminance >= 0 && backgroundLuminance <= 255;
+  const correctedInk = !soundEffect && (hasBrightBalloonCandidate || sourceColorIsBright);
+  const color = hasBackgroundEstimate && !soundEffect
+    ? backgroundLuminance < 128 ? '#ffffff' : '#21121a'
+    : correctedInk
+      ? '#21121a'
+      : /^#[0-9a-f]{6}$/i.test(sourceColor) ? sourceColor : '#21121a';
+  const outlineColor = hasBackgroundEstimate || hasBrightBalloonCandidate || !correctedInk
+    ? contrastingOutline(color)
+    : '#ffffff';
+  const correctedBrightInk = !hasBackgroundEstimate && correctedInk && sourceColorIsBright && !hasBrightBalloonCandidate;
 
   return {
     color,
-    outlineColor: contrastingOutline(color),
+    outlineColor,
     background: 'rgba(255, 255, 255, 0)',
     writingMode,
     fontSize: Math.round(Math.min(32, estimateFontSize(block, text, fitBox.width, fitBox.height) * (soundEffect ? 1.12 : 1))),
     fontWeight: soundEffect ? '700' : '600',
-    outlineWidth: soundEffect ? 2.6 : colorLuminance(color) >= 145 ? 1.1 : 0,
+    outlineWidth: soundEffect ? 2.6 : correctedBrightInk || colorLuminance(color) >= 145 ? 1.1 : 0,
     rotation: soundEffect && Number.isFinite(sourceRotation) ? Math.min(45, Math.max(-45, sourceRotation)) : 0,
     balanceLines: korean,
     soundEffect,
   };
+}
+
+export function automaticLetteringPolygon(block) {
+  const source = parsePolygon(block?.polygon_json ?? block?.polygon);
+  const layout = parseObject(block?.layoutHint ?? block?.layout_hint_json);
+  const candidate = parsePolygon(layout.letteringPolygon);
+  return isPlausibleBalloonBox(polygonDimensions(source), polygonDimensions(candidate))
+    ? candidate
+    : source;
+}
+
+function isPlausibleBalloonBox(sourceBox, balloonBox) {
+  const sourceArea = sourceBox.width * sourceBox.height;
+  const balloonArea = balloonBox.width * balloonBox.height;
+  if (!(sourceArea > 0 && balloonArea > 0)) return false;
+  if (balloonArea > sourceArea * MAX_BALLOON_AREA_RATIO) return false;
+  if (balloonBox.width > sourceBox.width * MAX_BALLOON_WIDTH_RATIO) return false;
+  if (balloonBox.height > sourceBox.height * MAX_BALLOON_HEIGHT_RATIO) return false;
+  return true;
 }
 
 export function inferLetteringContentKind(block, preferredKind = '') {

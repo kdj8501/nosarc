@@ -73,18 +73,20 @@ function createMaskCanvas(width, height, layers, padding, imagePixels = null) {
   context.lineCap = 'round';
   const paddingRatio = Math.min(0.24, Math.max(0, Number(padding) || 0));
   for (const layer of layers) {
-    const polygons = [...getInpaintPolygons(layer)];
+    const glyphPolygons = getInpaintPolygons(layer);
+    const polygons = glyphPolygons.map((polygon) => ({ polygon, sourceBounds: false }));
     const sourcePolygon = getSourcePolygon(layer);
+    // OCR ink contours can miss antialiased strokes. Fill the OCR bounds only
+    // when a tight balloon candidate or a clean, light interior makes it safe.
     if (sourcePolygon && (hasConfidentBalloonBox(layer, sourcePolygon) || hasLightUniformBackground(
       sourcePolygon,
-      getInpaintPolygons(layer),
+      glyphPolygons,
       width,
       height,
       imagePixels,
-    ))) {
-      polygons.push(sourcePolygon);
-    }
-    for (const polygon of polygons) {
+    ))) polygons.push({ polygon: sourcePolygon, sourceBounds: true });
+    for (const entry of polygons) {
+      const polygon = entry.polygon;
       const points = polygon
         .map((point) => ({ x: Number(point?.x), y: Number(point?.y) }))
         .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
@@ -95,7 +97,8 @@ function createMaskCanvas(width, height, layers, padding, imagePixels = null) {
       }));
       const xs = pixelPoints.map((point) => point.x);
       const ys = pixelPoints.map((point) => point.y);
-      const pad = Math.max(2, Math.round(Math.min(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)) * paddingRatio));
+      const effectivePadding = entry.sourceBounds ? Math.min(0.16, paddingRatio) : paddingRatio;
+      const pad = Math.max(2, Math.round(Math.min(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)) * effectivePadding));
       context.beginPath();
       context.moveTo(pixelPoints[0].x, pixelPoints[0].y);
       for (const point of pixelPoints.slice(1)) context.lineTo(point.x, point.y);
@@ -130,16 +133,19 @@ function hasConfidentBalloonBox(layer, sourcePolygon) {
   const layout = typeof layer.source_layout_hint_json === 'string'
     ? parseJson(layer.source_layout_hint_json, {})
     : layer.source_layout_hint_json || {};
-  const sourceArea = polygonBoundsArea(sourcePolygon);
-  const balloonArea = polygonBoundsArea(layout.letteringPolygon);
-  return sourceArea > 0 && balloonArea > 0 && balloonArea <= sourceArea * 10;
+  const source = polygonBounds(sourcePolygon);
+  const candidate = polygonBounds(layout.letteringPolygon);
+  const sourceArea = source.width * source.height;
+  const candidateArea = candidate.width * candidate.height;
+  return sourceArea > 0 && candidateArea > 0
+    && candidateArea <= sourceArea * 2.5
+    && candidate.width <= source.width * 1.8
+    && candidate.height <= source.height * 1.6;
 }
 
 function hasLightUniformBackground(sourcePolygon, glyphPolygons, width, height, pixels) {
   if (!pixels) return false;
-  const points = sourcePolygon
-    .map((point) => ({ x: Number(point?.x) * width, y: Number(point?.y) * height }))
-    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  const points = scalePolygon(sourcePolygon, width, height);
   if (points.length < 3) return false;
   const left = Math.max(0, Math.floor(Math.min(...points.map((point) => point.x))));
   const right = Math.min(width, Math.ceil(Math.max(...points.map((point) => point.x))));
@@ -148,10 +154,7 @@ function hasLightUniformBackground(sourcePolygon, glyphPolygons, width, height, 
   const shortSide = Math.min(right - left, bottom - top);
   if (shortSide < 10) return false;
   const band = Math.max(2, Math.round(shortSide * 0.16));
-  const scaledGlyphs = glyphPolygons.map((polygon) => polygon
-    .map((point) => ({ x: Number(point?.x) * width, y: Number(point?.y) * height }))
-    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y)))
-    .filter((polygon) => polygon.length >= 3);
+  const scaledGlyphs = glyphPolygons.map((polygon) => scalePolygon(polygon, width, height)).filter((polygon) => polygon.length >= 3);
   let count = 0;
   let sum = 0;
   let sumSquares = 0;
@@ -171,9 +174,24 @@ function hasLightUniformBackground(sourcePolygon, glyphPolygons, width, height, 
   if (count < 12) return false;
   const mean = sum / count;
   const deviation = Math.sqrt(Math.max(0, sumSquares / count - mean * mean));
-  // Manga balloon interiors often contain halftone and antialiasing. A strict
-  // near-white cutoff leaves original glyph fragments behind after inpainting.
   return mean >= 238 && deviation <= 45 && bright / count >= 0.82;
+}
+
+function scalePolygon(polygon, width, height) {
+  return polygon.map((point) => ({
+    x: Number(point?.x) * width,
+    y: Number(point?.y) * height,
+  })).filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+}
+
+function polygonBounds(polygon) {
+  if (!Array.isArray(polygon) || polygon.length < 3) return { width: 0, height: 0 };
+  const points = polygon.map((point) => ({ x: Number(point?.x), y: Number(point?.y) }))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  if (points.length < 3) return { width: 0, height: 0 };
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  return { width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) };
 }
 
 function pointInPolygon(x, y, polygon) {
@@ -185,17 +203,6 @@ function pointInPolygon(x, y, polygon) {
       && x < ((right.x - left.x) * (y - left.y)) / (right.y - left.y) + left.x) inside = !inside;
   }
   return inside;
-}
-
-function polygonBoundsArea(polygon) {
-  if (!Array.isArray(polygon) || polygon.length < 3) return 0;
-  const points = polygon
-    .map((point) => ({ x: Number(point?.x), y: Number(point?.y) }))
-    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
-  if (points.length < 3) return 0;
-  const xs = points.map((point) => point.x);
-  const ys = points.map((point) => point.y);
-  return Math.max(0, Math.max(...xs) - Math.min(...xs)) * Math.max(0, Math.max(...ys) - Math.min(...ys));
 }
 
 async function inpaint(imageData, mask, width, height, onProgress) {
