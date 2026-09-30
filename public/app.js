@@ -156,7 +156,7 @@ function renderChapter(chapter) {
     : failed
       ? `${JOB_LABELS[chapter.job_type] || '처리'} 실패`
       : readable
-        ? `${chapter.page_count}페이지${chapter.translation_count ? ' · 번역 완료' : ''}`
+        ? `${chapter.page_count}페이지${chapter.ocr_block_count && chapter.translation_count >= chapter.ocr_block_count ? ' · 번역 완료' : ''}`
         : processingStatusLabel(chapter.processing_status);
   const progressMarkup = active ? `<div class="chapter-progress"><progress max="100" value="${progress}"></progress></div>` : '';
   const readAction = readable ? `<button class="button small primary" data-read="${chapter.id}">읽기</button>` : '';
@@ -571,7 +571,10 @@ function watchJob(jobId, options = {}) {
 
     const jobLabel = JOB_LABELS[job.type] || '작업';
     const message = job.status === 'completed' ? `${jobLabel}이 완료되었습니다.` : job.status === 'failed' ? `${jobLabel} 실패: ${job.error_message || '원인을 확인해 주세요.'}` : `${jobLabel}이 취소되었습니다.`;
-    showNotice(message, job.status !== 'completed');
+    const completedMessage = job.status === 'completed' && job.error_message
+      ? `${message} ${job.error_message}`
+      : message;
+    showNotice(completedMessage, job.status !== 'completed');
     if (job.status === 'completed' && job.type === 'auto_translate' && options.showDialog) {
       if ($('#series-detail-dialog').open) $('#series-detail-dialog').close();
       closeProcessingDialog();

@@ -68,9 +68,11 @@ Windows에서는 기본적으로 `C:\Windows\Fonts\malgun.ttf`를 식자 폰트�
 
 기본 번역 모델은 일본어(`jpn_Jpan`)와 한국어(`kor_Hang`)를 지원하는 NLLB-200 distilled 600M이며, `data/models/nllb-200-distilled-600M`에 준비한 뒤 CTranslate2 형식으로 변환합니다. N100에서는 변환 후 INT8 모델만 실행합니다. 모델 경로와 언어 코드는 `.env`의 `AI_TRANSLATION_MODEL_PATH`, `AI_TRANSLATION_TOKENIZER_PATH`, `AI_TRANSLATION_SOURCE_CODE`, `AI_TRANSLATION_TARGET_CODE`로 바꿀 수 있습니다.
 
-번역 모델은 8B 급 이하로 제한합니다. Ollama의 `qwen3:8b`가 기본값이며, 로컬 `.env`에서 `AI_TRANSLATION_PROVIDER=ollama`로 설정하고 서버를 다시 시작하세요. 각 대사는 별도 요청으로 번역하되 같은 페이지의 앞뒤 대사와 작품 용어집을 참고해 문맥·인명을 유지합니다. 한국어 표현은 별도 교정 단계에서 다듬고 말풍선 대사·나레이션·효과음을 구분합니다. 모델, 주소, 요청 묶음 크기, 타임아웃, 추론 모드는 `AI_TRANSLATION_OLLAMA_MODEL`, `AI_TRANSLATION_OLLAMA_URL`, `AI_TRANSLATION_OLLAMA_BATCH_SIZE`, `AI_TRANSLATION_OLLAMA_TIMEOUT_MS`, `AI_TRANSLATION_OLLAMA_THINK`로 조정할 수 있습니다. 번역 요청은 기본적으로 Qwen의 추가 추론을 끄고 토큰 한도와 문맥 창을 줄여 응답 시간을 관리합니다. 추가 추론이 필요하면 `AI_TRANSLATION_OLLAMA_THINK=true`로 켤 수 있습니다.
+N100/16GB에서는 Ollama `qwen3:8b`를 상한으로 권장하며, 14B 모델은 메모리 여유와 응답 속도 때문에 사용하지 않습니다. 로컬 `.env`에서 `AI_TRANSLATION_PROVIDER=ollama`로 설정하고 서버를 다시 시작하세요. 각 대사는 별도 요청으로 번역하되 같은 페이지의 앞뒤 대사와 작품 용어집을 참고해 문맥·인명을 유지합니다. 한국어 표현은 별도 교정 단계에서 다듬고 말풍선 대사·나레이션·효과음을 구분합니다. 모델, 주소, 요청 묶음 크기, 타임아웃, 추론 모드는 `AI_TRANSLATION_OLLAMA_MODEL`, `AI_TRANSLATION_OLLAMA_URL`, `AI_TRANSLATION_OLLAMA_BATCH_SIZE`, `AI_TRANSLATION_OLLAMA_TIMEOUT_MS`, `AI_TRANSLATION_OLLAMA_THINK`로 조정할 수 있습니다. 번역 요청은 기본적으로 Qwen의 추가 추론을 끄고 토큰 한도와 문맥 창을 줄여 응답 시간을 관리합니다. 추가 추론이 필요하면 `AI_TRANSLATION_OLLAMA_THINK=true`로 켤 수 있습니다.
 
-자동 역식은 검출기의 글자 마스크를 획보다 넓혀 원문을 지우고, 확신도 높은 말풍선 안에서는 OCR 상자도 함께 지운 뒤 LaMa가 복원합니다. 말풍선 후보가 OCR 글자 영역보다 지나치게 크면 버려 이웃 말풍선까지 번역문이 뻗지 않게 합니다. 불확실한 영역에서는 획 마스크만 사용해 화면의 큰 부분이 네모나게 지워지지 않게 합니다. LaMa는 원본 해상도의 겹치는 512px 타일에서 복원하고, 대사·나레이션은 진한 글자색으로 외곽선 없이 식자합니다. 마스크 여백은 `INPAINT_PADDING`으로 조절합니다.
+자동 역식은 검출기의 글자 마스크를 획보다 넓혀 원문을 지우고, 확신도 높은 말풍선 안에서는 OCR 상자도 함께 지운 뒤 LaMa가 복원합니다. 말풍선 후보가 OCR 글자 영역보다 지나치게 크면 버려 이웃 말풍선까지 번역문이 뻗지 않게 합니다. 불확실한 영역에서는 획 마스크만 사용해 화면의 큰 부분이 네모나게 지워지지 않게 합니다. LaMa는 원본 해상도의 겹치는 512px 타일에서 복원하고, 대사·나레이션은 진한 글자색으로 외곽선 없이 식자합니다. 검은 말풍선 윤곽의 작은 틈을 보정해 내부를 추정하고, 후보가 이웃 OCR 글자와 겹치면 해당 확장을 취소합니다. 마스크 여백은 `INPAINT_PADDING`으로 조절합니다.
+
+일부 OCR 블록의 번역이 비어 있어도 나머지는 계속 식자합니다. 번역이 없는 블록은 원문을 보존하고, 완료 경고와 번역 편집기에서 나중에 보완할 수 있습니다. 기존 Manga OCR의 레이아웃 정보는 다음 자동 식질에서 새로 계산하며, OCR 원문과 기존 번역은 유지합니다.
 
 ```powershell
 & .\ai-worker\.venv\Scripts\hf.exe download facebook/nllb-200-distilled-600M --local-dir data/models/nllb-200-distilled-600M

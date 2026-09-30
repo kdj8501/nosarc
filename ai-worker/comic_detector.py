@@ -169,10 +169,17 @@ def _estimate_speech_balloon_box(
         return None
 
     gray = cv2.cvtColor(image[crop_top:crop_bottom, crop_left:crop_right], cv2.COLOR_BGR2GRAY)
-    _, white = cv2.threshold(gray, 238, 255, cv2.THRESH_BINARY)
-    # Restore tiny gaps caused by screen-tone dots inside otherwise white
-    # balloon interiors without using a wide kernel that can cross outlines.
-    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
+    # Close small breaks in dark balloon outlines before finding the bright
+    # interior. Closing the white pixels instead tends to join adjacent
+    # balloons through their outlines and makes the estimate unusable.
+    _, barriers = cv2.threshold(gray, 210, 255, cv2.THRESH_BINARY_INV)
+    kernel_size = max(3, min(11, int(round(min(text_width, text_height) * 0.08)) | 1))
+    barriers = cv2.morphologyEx(
+        barriers,
+        cv2.MORPH_CLOSE,
+        np.ones((kernel_size, kernel_size), dtype=np.uint8),
+    )
+    white = cv2.bitwise_not(barriers)
     local_left = max(0, left - crop_left)
     local_top = max(0, top - crop_top)
     local_right = min(crop_width, right - crop_left)
@@ -201,9 +208,17 @@ def _estimate_speech_balloon_box(
     if area < text_area * 1.25 or component_width < text_width * 1.12 or component_height < text_height * 1.08:
         return None
 
-    # Leave a generous inset so the auto layout stays inside the balloon outline.
-    inset_x = max(3, int(component_width * 0.12))
-    inset_y = max(3, int(component_height * 0.12))
+    # Keep a small inset from the detected outline while preserving the OCR
+    # region. A fixed large inset often discarded the balloon that contained
+    # the text, leaving Korean cramped into the original Japanese columns.
+    left_room = left - (crop_left + component_left)
+    right_room = crop_left + component_right - right
+    top_room = top - (crop_top + component_top)
+    bottom_room = crop_top + component_bottom - bottom
+    if min(left_room, right_room, top_room, bottom_room) < 2:
+        return None
+    inset_x = min(max(3, int(component_width * 0.04)), left_room - 1, right_room - 1)
+    inset_y = min(max(3, int(component_height * 0.04)), top_room - 1, bottom_room - 1)
     box_left = crop_left + component_left + inset_x
     box_top = crop_top + component_top + inset_y
     box_right = crop_left + component_right - inset_x

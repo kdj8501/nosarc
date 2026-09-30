@@ -36,6 +36,7 @@ const { createCanvas } = canvas;
 const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const LETTERING_LAYOUT_VERSION = 'balloon-interior-v2';
 loadDotEnv(path.join(ROOT, '.env'));
 const venvPythonPath = path.join(ROOT, 'ai-worker', '.venv', process.platform === 'win32' ? 'Scripts' : 'bin', process.platform === 'win32' ? 'python.exe' : 'python');
 const configuredWorkerCommand = String(process.env.AI_WORKER_COMMAND || '').trim();
@@ -637,7 +638,10 @@ app.patch('/api/ocr-blocks/:id', async (req, res) => {
   const sourceText = String(req.body?.sourceText ?? current.source_text).trim();
   if (!sourceText) return res.status(400).json({ error: 'OCR 원문을 입력해 주세요.' });
   const layoutHint = parseJson(current.layout_hint_json, {});
-  if (req.body?.polygon !== undefined) delete layoutHint.letteringPolygon;
+  if (req.body?.polygon !== undefined) {
+    delete layoutHint.letteringPolygon;
+    delete layoutHint.letteringLayoutVersion;
+  }
   const now = new Date().toISOString();
   db.prepare(`UPDATE ocr_blocks SET polygon_json = ?, layout_hint_json = ?, source_text = ?, confidence = ?, reading_order = ?, updated_at = ? WHERE id = ?`).run(
     JSON.stringify(polygon),
@@ -656,7 +660,7 @@ app.patch('/api/ocr-blocks/:id', async (req, res) => {
 });
 
 app.post('/api/ocr-blocks/:id/translations', async (req, res) => {
-  const block = db.prepare(`SELECT b.*, c.series_id, s.target_language AS series_target_language FROM ocr_blocks b
+  const block = db.prepare(`SELECT b.*, p.width, p.height, c.series_id, s.target_language AS series_target_language FROM ocr_blocks b
     JOIN pages p ON p.id = b.page_id JOIN chapters c ON c.id = p.chapter_id JOIN series s ON s.id = c.series_id
     WHERE b.id = ?`).get(req.params.id);
   if (!block) return res.status(404).json({ error: 'OCR 블록을 찾을 수 없습니다.' });
@@ -904,13 +908,14 @@ async function removeAssetFiles(assets) {
 }
 
 function listChapters(seriesId) {
-  return db.prepare(`SELECT c.*, a.original_name AS source_name FROM chapters c JOIN assets a ON a.id = c.source_asset_id
+  return db.prepare(`SELECT c.*, s.target_language, a.original_name AS source_name FROM chapters c
+    JOIN series s ON s.id = c.series_id JOIN assets a ON a.id = c.source_asset_id
     WHERE c.series_id = ? ORDER BY c.sort_key ASC, c.created_at ASC`).all(seriesId).map((chapter) => {
     const job = latestJob(chapter.id);
     return {
       ...chapter,
       ocr_block_count: db.prepare('SELECT COUNT(*) AS count FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ?').get(chapter.id).count,
-      translation_count: db.prepare('SELECT COUNT(*) AS count FROM translations t JOIN ocr_blocks b ON b.id = t.ocr_block_id JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ? AND t.is_active = 1').get(chapter.id).count,
+      translation_count: db.prepare('SELECT COUNT(DISTINCT b.id) AS count FROM translations t JOIN ocr_blocks b ON b.id = t.ocr_block_id JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ? AND t.target_language = ? AND t.is_active = 1').get(chapter.id, chapter.target_language).count,
       job_id: job?.id || null,
       job_type: job?.type || null,
       job_status: job?.status || null,
@@ -952,7 +957,7 @@ function getChapter(id) {
 }
 
 function getOcrBlock(id) {
-  const block = db.prepare('SELECT * FROM ocr_blocks WHERE id = ?').get(id);
+  const block = db.prepare('SELECT b.*, p.width, p.height FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE b.id = ?').get(id);
   return block ? serializeOcrBlock(block) : null;
 }
 
@@ -1339,22 +1344,34 @@ async function runAutoTranslationJob(jobId) {
   const job = db.prepare(`SELECT * FROM jobs WHERE id = ? AND type = 'auto_translate'`).get(jobId);
   if (!job || job.status === 'cancelled') return;
   const chapter = db.prepare(`SELECT c.*, s.target_language FROM chapters c JOIN series s ON s.id = c.series_id WHERE c.id = ?`).get(job.chapter_id);
-  const blocks = db.prepare(`SELECT b.*, p.width, p.height FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ? ORDER BY p.page_index, b.reading_order, b.created_at`).all(job.chapter_id);
+  const blocks = db.prepare(`SELECT b.*, p.width, p.height, p.page_index FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ? ORDER BY p.page_index, b.reading_order, b.created_at`).all(job.chapter_id);
   if (!chapter || !blocks.length) return failAutoTranslationJob(jobId, '자동 번역할 OCR 블록이 없습니다.');
   const styleProfiles = getLetteringStyleProfiles(chapter.series_id);
   const glossaryTerms = listSeriesTerms(chapter.series_id);
   const glossaryVersion = getSeriesGlossaryVersion(glossaryTerms);
+  const entityGlossary = new Map(glossaryTerms.map((term) => [term.source_term, {
+    source: term.source_term,
+    target: term.target_term,
+    reading: term.source_reading,
+    aliases: term.aliases,
+    kind: term.kind,
+    notes: term.notes,
+  }]));
 
   db.prepare(`UPDATE jobs SET status = 'running', current_stage = 'translation', progress = 1, started_at = ?, error_message = NULL WHERE id = ?`)
     .run(new Date().toISOString(), jobId);
   let ollamaModelReleased = config.aiTranslationProvider !== 'ollama';
   try {
+    await refreshStaleLetteringLayouts(jobId, chapter.id, blocks);
+    if (isJobCancelled(jobId)) return;
     const updateTranslationProgress = (progress) => {
-      db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(75, 3 + Math.round(progress * 0.72)), jobId);
+      db.prepare('UPDATE jobs SET progress = MAX(progress, ?) WHERE id = ?').run(Math.min(75, 3 + Math.round(progress * 0.72)), jobId);
     };
     let results;
+    let ollamaController;
     if (config.aiTranslationProvider === 'ollama') {
       const controller = new AbortController();
+      ollamaController = controller;
       activeAiProcesses.set(jobId, { kill: () => controller.abort() });
       results = await translateWithOllama(blocks, {
         baseUrl: config.aiTranslationOllamaUrl,
@@ -1362,14 +1379,7 @@ async function runAutoTranslationJob(jobId) {
         targetLanguage: chapter.target_language || 'ko',
         batchSize: config.aiTranslationOllamaBatchSize,
         think: config.aiTranslationOllamaThink,
-        entityGlossary: new Map(glossaryTerms.map((term) => [term.source_term, {
-          source: term.source_term,
-          target: term.target_term,
-          reading: term.source_reading,
-          aliases: term.aliases,
-          kind: term.kind,
-          notes: term.notes,
-        }])),
+        entityGlossary,
         timeoutMs: config.aiTranslationOllamaTimeoutMs,
         signal: controller.signal,
         isCancelled: () => isJobCancelled(jobId),
@@ -1387,18 +1397,49 @@ async function runAutoTranslationJob(jobId) {
     if (isJobCancelled(jobId)) return;
     if (!Array.isArray(results) || results.length !== blocks.length) throw new Error('AI 워커가 모든 OCR 블록의 번역 결과를 반환하지 않았습니다.');
 
-    const missingTranslations = blocks.reduce((count, block, index) => (
-      count + (String(block.source_text || '').trim() && !String(results[index]?.text || '').trim() ? 1 : 0)
-    ), 0);
-    if (missingTranslations) {
-      throw new Error(`번역 결과가 비어 있는 OCR 블록 ${missingTranslations}개가 있어 자동 식질을 중단했습니다. OCR 내용을 확인한 뒤 다시 실행해 주세요.`);
+    if (config.aiTranslationProvider === 'ollama') {
+      for (let attempt = 0; attempt < 1; attempt += 1) {
+        const missingIndexes = blocks.flatMap((block, index) => (
+          String(block.source_text || '').trim()
+            && (!String(results[index]?.text || '').trim()
+              || (isKoreanTargetLanguage(chapter.target_language || 'ko') && !isKoreanText(results[index].text)))
+            ? [index]
+            : []
+        ));
+        if (!missingIndexes.length || isJobCancelled(jobId)) break;
+        const retryBlocks = missingIndexes.map((index) => ({
+          ...blocks[index],
+          nearbyDialogue: collectOllamaRetryContext(blocks, index),
+        }));
+        const retryResults = await translateWithOllama(retryBlocks, {
+          baseUrl: config.aiTranslationOllamaUrl,
+          model: config.aiTranslationOllamaModel,
+          targetLanguage: chapter.target_language || 'ko',
+          batchSize: 1,
+          think: config.aiTranslationOllamaThink,
+          entityGlossary,
+          timeoutMs: config.aiTranslationOllamaTimeoutMs,
+          signal: ollamaController.signal,
+          isCancelled: () => isJobCancelled(jobId),
+          onProgress: () => {},
+        });
+        if (isJobCancelled(jobId)) return;
+        retryResults.forEach((result, retryIndex) => {
+          const translatedText = String(result?.text || '').trim();
+          if (translatedText) results[missingIndexes[retryIndex]] = result;
+        });
+      }
     }
 
-    if (isKoreanTargetLanguage(chapter.target_language || 'ko')
-      && results.some((result) => String(result?.text || '').trim() && !isKoreanText(result.text))) {
-      throw new Error('번역 모델이 한국어가 아닌 문장을 반환해 저장을 중단했습니다. 목표 언어와 모델 설정을 확인해 주세요.');
+    if (isJobCancelled(jobId)) return;
+    if (isKoreanTargetLanguage(chapter.target_language || 'ko')) {
+      results = results.map((result) => {
+        const translatedText = String(result?.text || '').trim();
+        return translatedText && !isKoreanText(translatedText)
+          ? { ...result, text: '' }
+          : result;
+      });
     }
-
     const now = new Date().toISOString();
     const translatorId = config.aiTranslationProvider === 'ollama' ? 'ollama' : 'ctranslate2';
     const translatorVersion = config.aiTranslationProvider === 'ollama'
@@ -1447,6 +1488,13 @@ async function runAutoTranslationJob(jobId) {
     });
     saveTranslations();
     if (isJobCancelled(jobId)) return;
+    const untranslatedCount = db.prepare(`SELECT COUNT(*) AS count FROM ocr_blocks b
+      JOIN pages p ON p.id = b.page_id
+      WHERE p.chapter_id = ? AND TRIM(b.source_text) <> ''
+        AND NOT EXISTS (
+          SELECT 1 FROM translations t
+          WHERE t.ocr_block_id = b.id AND t.target_language = ? AND t.is_active = 1 AND TRIM(t.translated_text) <> ''
+        )`).get(chapter.id, chapter.target_language || 'ko').count;
     if (config.aiTranslationProvider === 'ollama') ollamaModelReleased = await unloadOllamaTranslationModel();
     db.prepare('UPDATE jobs SET current_stage = ?, progress = ? WHERE id = ?').run('rendering', 75, jobId);
     const rendered = await renderChapterImages(chapter.id, jobId, (progress) => {
@@ -1454,13 +1502,33 @@ async function runAutoTranslationJob(jobId) {
     });
     if (!rendered || isJobCancelled(jobId)) return;
     const finishedAt = new Date().toISOString();
-    db.prepare(`UPDATE jobs SET status = 'completed', current_stage = 'completed', progress = 100, finished_at = ?, error_message = NULL WHERE id = ?`).run(finishedAt, jobId);
+    const completionWarning = untranslatedCount
+      ? `번역이 없는 OCR 블록 ${untranslatedCount}개는 원문을 유지했습니다. 번역 편집기에서 보완할 수 있습니다.`
+      : null;
+    db.prepare(`UPDATE jobs SET status = 'completed', current_stage = 'completed', progress = 100, finished_at = ?, error_message = ? WHERE id = ?`).run(finishedAt, completionWarning, jobId);
   } catch (error) {
     if (!isJobCancelled(jobId)) await failAutoTranslationJob(jobId, error.message || '자동 번역에 실패했습니다.');
   } finally {
     if (!ollamaModelReleased) await unloadOllamaTranslationModel();
     activeAiProcesses.delete(jobId);
   }
+}
+
+function collectOllamaRetryContext(blocks, index) {
+  const block = blocks[index];
+  const pageBlocks = blocks.filter((candidate) => candidate.page_id === block.page_id);
+  const position = pageBlocks.findIndex((candidate) => candidate.id === block.id);
+  const before = [];
+  const after = [];
+  for (let distance = 2; distance >= 1; distance -= 1) {
+    const text = String(pageBlocks[position - distance]?.source_text || '').trim();
+    if (text) before.push({ position: 'before', distance, text });
+  }
+  for (let distance = 1; distance <= 2; distance += 1) {
+    const text = String(pageBlocks[position + distance]?.source_text || '').trim();
+    if (text) after.push({ position: 'after', distance, text });
+  }
+  return [...before, ...after];
 }
 
 function normalizeLetteringContentKind(value) {
@@ -1667,9 +1735,81 @@ async function runComicTextDetectorWorker(jobId, pages, onProgress) {
   for (const [pageIndex, blocks] of blocksByPage) {
     const pageBlocks = blocks.filter(Boolean);
     suppressSharedLetteringRegions(pageBlocks);
+    for (const block of pageBlocks) block.layoutHint.letteringLayoutVersion = LETTERING_LAYOUT_VERSION;
     blocksByPage.set(pageIndex, pageBlocks);
   }
   return blocksByPage;
+}
+
+async function refreshStaleLetteringLayouts(jobId, chapterId, blocks) {
+  if (config.ocrProvider !== 'manga-ocr') return;
+  const stalePageIndexes = new Set(blocks
+    .filter((block) => parseJson(block.layout_hint_json, {}).letteringLayoutVersion !== LETTERING_LAYOUT_VERSION)
+    .map((block) => block.page_index));
+  if (!stalePageIndexes.size) return;
+
+  const pages = db.prepare(`SELECT p.*, a.storage_key, a.original_name, a.mime_type FROM pages p
+    JOIN assets a ON a.id = p.image_asset_id WHERE p.chapter_id = ? ORDER BY p.page_index`)
+    .all(chapterId)
+    .filter((page) => stalePageIndexes.has(page.page_index));
+  let detectedLayouts;
+  try {
+    detectedLayouts = await runComicTextDetectorWorker(jobId, pages, () => {});
+  } catch (error) {
+    console.warn(`말풍선 레이아웃 보정은 건너뜁니다: ${error.message}`);
+    return;
+  }
+  if (isJobCancelled(jobId)) return;
+
+  const refreshedByPage = new Map();
+  for (const pageIndex of stalePageIndexes) {
+    const pageBlocks = blocks.filter((block) => block.page_index === pageIndex);
+    const pageDetections = detectedLayouts.get(pageIndex) || [];
+    const refreshed = pageBlocks.map((block) => {
+      const layoutHint = parseJson(block.layout_hint_json, {});
+      if (layoutHint.letteringLayoutVersion !== LETTERING_LAYOUT_VERSION) {
+        const sourceBounds = getNormalizedPolygonBounds(parseJson(block.polygon_json, []));
+        const matches = pageDetections
+          .map((detection) => ({ detection, overlap: polygonOverlapRatio(sourceBounds, getNormalizedPolygonBounds(detection.polygon)) }))
+          .filter((candidate) => candidate.overlap >= 0.5)
+          .sort((left, right) => right.overlap - left.overlap);
+        const matchedDetection = matches.find((candidate) => candidate.detection.readingOrder === block.reading_order)?.detection
+          || matches[0]?.detection;
+        const detectedPolygon = matchedDetection?.layoutHint?.letteringPolygon;
+        if (detectedPolygon) layoutHint.letteringPolygon = detectedPolygon;
+        layoutHint.letteringLayoutVersion = LETTERING_LAYOUT_VERSION;
+      }
+      return {
+        ...block,
+        polygon: parseJson(block.polygon_json, []),
+        layoutHint,
+      };
+    });
+    suppressSharedLetteringRegions(refreshed);
+    refreshedByPage.set(pageIndex, refreshed);
+  }
+
+  const now = new Date().toISOString();
+  const originalBlocksById = new Map(blocks.map((block) => [block.id, block]));
+  const updateLayouts = db.transaction(() => {
+    const updateLayout = db.prepare('UPDATE ocr_blocks SET layout_hint_json = ?, updated_at = ? WHERE id = ?');
+    for (const pageBlocks of refreshedByPage.values()) {
+      for (const block of pageBlocks) {
+        block.layout_hint_json = JSON.stringify(block.layoutHint);
+        updateLayout.run(block.layout_hint_json, now, block.id);
+        const original = originalBlocksById.get(block.id);
+        if (original) original.layout_hint_json = block.layout_hint_json;
+      }
+    }
+  });
+  updateLayouts();
+}
+
+function polygonOverlapRatio(left, right) {
+  if (!left?.area || !right?.area) return 0;
+  const intersectionWidth = Math.max(0, Math.min(left.right, right.right) - Math.max(left.left, right.left));
+  const intersectionHeight = Math.max(0, Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top));
+  return (intersectionWidth * intersectionHeight) / Math.min(left.area, right.area);
 }
 
 function suppressSharedLetteringRegions(blocks) {
@@ -1688,6 +1828,20 @@ function suppressSharedLetteringRegions(blocks) {
       if (smallerArea > 0 && intersection / smallerArea >= 0.78) {
         ambiguous.add(left.index);
         ambiguous.add(right.index);
+      }
+    }
+  }
+  for (const candidate of candidates) {
+    for (const [blockIndex, block] of blocks.entries()) {
+      if (blockIndex === candidate.index) continue;
+      const textBounds = getNormalizedPolygonBounds(block.polygon);
+      if (!textBounds?.area) continue;
+      const intersectionWidth = Math.max(0, Math.min(candidate.bounds.right, textBounds.right) - Math.max(candidate.bounds.left, textBounds.left));
+      const intersectionHeight = Math.max(0, Math.min(candidate.bounds.bottom, textBounds.bottom) - Math.max(candidate.bounds.top, textBounds.top));
+      const overlapRatio = (intersectionWidth * intersectionHeight) / textBounds.area;
+      if (overlapRatio >= 0.08) {
+        ambiguous.add(candidate.index);
+        break;
       }
     }
   }

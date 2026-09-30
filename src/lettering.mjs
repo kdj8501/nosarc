@@ -30,15 +30,20 @@ export function autoLetteringStyle(block, translatedText = '', targetLanguage = 
   const fitBox = useBalloonBox ? balloonBox : sourceBox;
   const width = sourceBox.width;
   const height = sourceBox.height;
+  const pageWidth = Number(block?.width);
+  const pageHeight = Number(block?.height);
+  const regionAspectRatio = width > 0
+    ? (height * (pageHeight > 0 ? pageHeight : 1)) / (width * (pageWidth > 0 ? pageWidth : 1))
+    : 0;
 
-  // Use horizontal Korean for ordinary text, while preserving vertical flow for
-  // very short captions and vertically designed sound effects.
-  const tinyVerticalCaption = korean && width > 0 && height > width * 4.5 && hangulCount <= 2;
+  // Use horizontal Korean for ordinary dialogue, but keep short labels and
+  // captions vertical when their original region is a narrow Japanese column.
+  const shortVerticalText = korean && regionAspectRatio > 2.4 && hangulCount > 0 && hangulCount <= 6;
   const sourceVertical = layout.vertical === true;
-  const preserveVertical = (soundEffect && sourceVertical) || tinyVerticalCaption;
+  const preserveVertical = (soundEffect && sourceVertical) || (sourceVertical && shortVerticalText);
   const writingMode = korean
     ? preserveVertical ? 'vertical-rl' : 'horizontal-tb'
-    : sourceVertical || height > width * 1.25 ? 'vertical-rl' : 'horizontal-tb';
+    : sourceVertical || regionAspectRatio > 1.25 ? 'vertical-rl' : 'horizontal-tb';
   const sourceColor = String(layout.foregroundColor || '');
   const sourceRotation = Number(layout.rotation);
   const color = /^#[0-9a-f]{6}$/i.test(sourceColor) ? sourceColor : '#21121a';
