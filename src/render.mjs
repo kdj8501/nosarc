@@ -11,6 +11,7 @@ export async function renderTranslatedPage(sourcePath, layers, {
   fontFamily = 'Malgun Gothic',
   fontPath = '',
   skipInpaint = false,
+  originalSourcePath = '',
   onInpaintProgress = () => {},
 } = {}) {
   registerFont(fontPath, fontFamily);
@@ -32,6 +33,34 @@ export async function renderTranslatedPage(sourcePath, layers, {
     context.putImageData(imageData, 0, 0);
   }
 
+  // Use original pixels to identify flat paper-white backgrounds. Generated
+  // textures are inappropriate here and can leave reconstructed ink behind.
+  if (originalSourcePath) {
+    const original = await loadImage(originalSourcePath);
+    if (original.width === width && original.height === height) {
+      const paper = createCanvas(width, height);
+      const paperContext = paper.getContext('2d');
+      paperContext.drawImage(original, 0, 0);
+      const pixels = paperContext.getImageData(0, 0, width, height).data;
+      for (const layer of safeLayers) {
+        const polygon = getSourcePolygon(layer);
+        if (!polygon || !(hasLightUniformBackground(polygon, getInpaintPolygons(layer), width, height, pixels)
+            || hasWhiteSideMargins(polygon, width, height, pixels))) continue;
+        context.save();
+        context.fillStyle = '#ffffff';
+        for (const region of [polygon, ...getInpaintPolygons(layer)]) {
+          const points = scalePolygon(region, width, height);
+          if (points.length < 3) continue;
+          context.beginPath();
+          context.moveTo(points[0].x, points[0].y);
+          for (const point of points.slice(1)) context.lineTo(point.x, point.y);
+          context.closePath();
+          context.fill();
+        }
+        context.restore();
+      }
+    }
+  }
   for (const layer of safeLayers) drawLettering(context, layer, width, height, fontFamily);
   return output.toBuffer('image/png');
 }
@@ -76,9 +105,21 @@ function createMaskCanvas(width, height, layers, padding, imagePixels = null) {
     const glyphPolygons = getInpaintPolygons(layer);
     const polygons = glyphPolygons.map((polygon) => ({ polygon, sourceBounds: false }));
     const sourcePolygon = getSourcePolygon(layer);
+    const confidentBalloon = sourcePolygon && hasConfidentBalloonBox(layer, sourcePolygon);
+    context.save();
+    if (confidentBalloon) {
+      const layout = typeof layer.source_layout_hint_json === 'string'
+        ? parseJson(layer.source_layout_hint_json, {}) : layer.source_layout_hint_json;
+      const interior = scalePolygon(layout.letteringPolygon, width, height);
+      context.beginPath();
+      context.moveTo(interior[0].x, interior[0].y);
+      for (const point of interior.slice(1)) context.lineTo(point.x, point.y);
+      context.closePath();
+      context.clip();
+    }
     // OCR ink contours can miss antialiased strokes. Fill the OCR bounds only
     // when a tight balloon candidate or a clean, light interior makes it safe.
-    if (sourcePolygon && (hasConfidentBalloonBox(layer, sourcePolygon) || hasLightUniformBackground(
+    if (sourcePolygon && (confidentBalloon || hasLightUniformBackground(
       sourcePolygon,
       glyphPolygons,
       width,
@@ -98,7 +139,10 @@ function createMaskCanvas(width, height, layers, padding, imagePixels = null) {
       const xs = pixelPoints.map((point) => point.x);
       const ys = pixelPoints.map((point) => point.y);
       const effectivePadding = entry.sourceBounds ? Math.min(0.16, paddingRatio) : paddingRatio;
-      const pad = Math.max(2, Math.round(Math.min(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)) * effectivePadding));
+      // Expand enough to cover antialiased strokes without erasing nearby art.
+      // A percentage alone can turn a large effect's contour into a broad wipe.
+      const maximumPadding = entry.sourceBounds ? 6 : 4;
+      const pad = Math.min(maximumPadding, Math.max(2, Math.round(Math.min(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)) * effectivePadding)));
       context.beginPath();
       context.moveTo(pixelPoints[0].x, pixelPoints[0].y);
       for (const point of pixelPoints.slice(1)) context.lineTo(point.x, point.y);
@@ -109,6 +153,7 @@ function createMaskCanvas(width, height, layers, padding, imagePixels = null) {
         context.stroke();
       }
     }
+    context.restore();
   }
   return maskCanvas;
 }
@@ -140,7 +185,9 @@ function hasConfidentBalloonBox(layer, sourcePolygon) {
   return sourceArea > 0 && candidateArea > 0
     && candidateArea <= sourceArea * 2.5
     && candidate.width <= source.width * 1.8
-    && candidate.height <= source.height * 1.6;
+    && candidate.height <= source.height * 1.6
+    && sourcePolygon.every((point) => pointInPolygon(Number(point.x), Number(point.y), layout.letteringPolygon)
+      || layout.letteringPolygon.some((candidatePoint) => Math.abs(candidatePoint.x - point.x) < 1e-6 && Math.abs(candidatePoint.y - point.y) < 1e-6));
 }
 
 function hasLightUniformBackground(sourcePolygon, glyphPolygons, width, height, pixels) {
@@ -174,7 +221,7 @@ function hasLightUniformBackground(sourcePolygon, glyphPolygons, width, height, 
   if (count < 12) return false;
   const mean = sum / count;
   const deviation = Math.sqrt(Math.max(0, sumSquares / count - mean * mean));
-  return mean >= 238 && deviation <= 45 && bright / count >= 0.82;
+  return mean >= 215 && deviation <= 95 && bright / count >= 0.85;
 }
 
 function scalePolygon(polygon, width, height) {
@@ -182,6 +229,42 @@ function scalePolygon(polygon, width, height) {
     x: Number(point?.x) * width,
     y: Number(point?.y) * height,
   })).filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+}
+
+function hasWhiteSideMargins(polygon, width, height, pixels) {
+  const points = scalePolygon(polygon, width, height);
+  if (points.length < 3) return false;
+  const left = Math.floor(Math.min(...points.map((point) => point.x)));
+  const right = Math.ceil(Math.max(...points.map((point) => point.x)));
+  const top = Math.max(0, Math.floor(Math.min(...points.map((point) => point.y))));
+  const bottom = Math.min(height, Math.ceil(Math.max(...points.map((point) => point.y))));
+  const band = Math.max(2, Math.min(6, Math.round((right - left) * 0.08)));
+  if (left < band || right + band >= width || bottom - top < 20) return false;
+  const isWhite = (x, y) => {
+    const offset = (y * width + x) * 4;
+    return Math.min(pixels[offset], pixels[offset + 1], pixels[offset + 2]) >= 242;
+  };
+  const margins = [];
+  for (const [start, end] of [[left - band, left], [right, right + band]]) {
+    let count = 0, white = 0;
+    for (let y = top; y < bottom; y += 2) for (let x = start; x < end; x++) {
+      count++; if (isWhite(x, y)) white++;
+    }
+    if (count < 20) return false;
+    margins.push(white / count);
+  }
+  let count = 0, white = 0;
+  for (let y = top; y < bottom; y += 2) for (let x = left; x < right; x += 2) {
+    count++; if (isWhite(x, y)) white++;
+  }
+  if (count <= 20) return false;
+  const interiorWhite = white / count;
+  // Furigana often lies immediately beside the main text and darkens one
+  // margin. Require corroborating white pixels on the opposite margin and
+  // throughout the OCR region; reject dense illustrated/textured regions.
+  return (Math.min(...margins) >= 0.75 && interiorWhite >= 0.55)
+    || (Math.min(...margins) >= 0.65 && Math.max(...margins) >= 0.8 && interiorWhite >= 0.65)
+    || (Math.min(...margins) >= 0.9 && interiorWhite >= 0.45);
 }
 
 function polygonBounds(polygon) {

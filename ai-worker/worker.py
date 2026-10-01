@@ -128,6 +128,7 @@ def translate(request: dict[str, Any]) -> None:
 def recognize_manga(request: dict[str, Any]) -> None:
     try:
         from manga_ocr import MangaOcr
+        from ocr_layout import vertical_ocr_crops
         from PIL import Image
     except ImportError as error:
         raise RuntimeError(
@@ -168,13 +169,18 @@ def recognize_manga(request: dict[str, Any]) -> None:
                 bottom = max(point[1] for point in points) * height
                 pad_x = max(2, round((right - left) * padding))
                 pad_y = max(2, round((bottom - top) * padding))
+                # Percentage padding on a page-height column can pull in
+                # portraits and unrelated neighboring captions.
+                if (bottom - top) / max(right - left, 1) >= 6:
+                    pad_y = min(pad_y, max(2, round((right - left) * 0.25)))
                 min_x = max(0, int(left) - pad_x)
                 min_y = max(0, int(top) - pad_y)
                 max_x = min(width, int(right) + pad_x)
                 max_y = min(height, int(bottom) + pad_y)
                 text = ""
                 if max_x > min_x and max_y > min_y:
-                    text = str(mocr(image.crop((min_x, min_y, max_x, max_y)))).strip()
+                    crop = image.crop((min_x, min_y, max_x, max_y))
+                    text = ''.join(str(mocr(part)).strip() for part in vertical_ocr_crops(crop))
                 emit({
                     "type": "ocr_result",
                     "pageIndex": int(page.get("pageIndex", 0)),
@@ -236,6 +242,7 @@ def inpaint_lama(request: dict[str, Any]) -> None:
     try:
         import numpy as np
         import onnxruntime as ort
+        from inpaint_layout import text_centered_tiles
         from PIL import Image
     except ImportError as error:
         raise RuntimeError(
@@ -274,58 +281,43 @@ def inpaint_lama(request: dict[str, Any]) -> None:
             mask_array = (np.asarray(mask, dtype=np.uint8) > 0)
             image_height, image_width = mask_array.shape
             tile_size = 512
-            tile_step = 448
-
-            def tile_starts(length: int) -> list[int]:
-                starts = [0]
-                while starts[-1] + tile_size < length:
-                    starts.append(starts[-1] + tile_step)
-                return starts
-
-            x_starts = tile_starts(image_width)
-            y_starts = tile_starts(image_height)
-            tile_count = sum(
-                bool(mask_array[top:min(top + tile_size, image_height), left:min(left + tile_size, image_width)].any())
-                for top in y_starts for left in x_starts
-            )
+            tiles = text_centered_tiles(mask_array, tile_size=tile_size)
+            tile_count = len(tiles)
             accumulated = np.zeros((image_height, image_width, 3), dtype=np.float32)
             accumulated_weight = np.zeros((image_height, image_width), dtype=np.float32)
             axis = np.minimum(np.arange(tile_size) + 1, tile_size - np.arange(tile_size)).astype(np.float32)
             feather = np.clip(axis / 32.0, 0.05, 1.0)
             tile_index = 0
 
-            for top in y_starts:
-                for left in x_starts:
-                    bottom = min(top + tile_size, image_height)
-                    right = min(left + tile_size, image_width)
-                    mask_crop = mask_array[top:bottom, left:right]
-                    if not mask_crop.any():
-                        continue
+            for left, top, right, bottom in tiles:
+                mask_crop = mask_array[top:bottom, left:right]
+                if not mask_crop.any():
+                    continue
 
-                    image_crop = image_array[top:bottom, left:right]
-                    pad_y = tile_size - image_crop.shape[0]
-                    pad_x = tile_size - image_crop.shape[1]
-                    image_tile = np.pad(image_crop, ((0, pad_y), (0, pad_x), (0, 0)), mode="reflect")
-                    mask_tile = np.zeros((tile_size, tile_size), dtype=np.float32)
-                    mask_tile[:mask_crop.shape[0], :mask_crop.shape[1]] = mask_crop.astype(np.float32)
-                    image_tensor = np.transpose(image_tile[:, :, ::-1].astype(np.float32) / 255.0, (2, 0, 1))[None, ...]
-                    model_mask = (mask_tile > 0).astype(np.float32)[None, None, ...]
-                    output = model.run(["output"], {"image": image_tensor, "mask": model_mask})[0][0]
-                    output = np.transpose(output, (1, 2, 0))
-                    if float(output.max()) <= 1.5:
-                        output = output * 255.0
-                    output = np.clip(output, 0, 255).astype(np.uint8)[:, :, ::-1]
+                image_crop = image_array[top:bottom, left:right]
+                pad_y = tile_size - image_crop.shape[0]
+                pad_x = tile_size - image_crop.shape[1]
+                image_tile = np.pad(image_crop, ((0, pad_y), (0, pad_x), (0, 0)), mode="reflect")
+                mask_tile = np.zeros((tile_size, tile_size), dtype=np.float32)
+                mask_tile[:mask_crop.shape[0], :mask_crop.shape[1]] = mask_crop.astype(np.float32)
+                image_tensor = np.transpose(image_tile[:, :, ::-1].astype(np.float32) / 255.0, (2, 0, 1))[None, ...]
+                model_mask = (mask_tile > 0).astype(np.float32)[None, None, ...]
+                output = model.run(["output"], {"image": image_tensor, "mask": model_mask})[0][0]
+                output = np.transpose(output, (1, 2, 0))
+                if float(output.max()) <= 1.5:
+                    output = output * 255.0
+                output = np.clip(output, 0, 255).astype(np.uint8)[:, :, ::-1]
 
-                    weights = feather[:mask_crop.shape[0], None] * feather[None, :mask_crop.shape[1]]
-                    weights = weights * mask_crop.astype(np.float32)
-                    accumulated[top:bottom, left:right] += output[:mask_crop.shape[0], :mask_crop.shape[1]].astype(np.float32) * weights[:, :, None]
-                    accumulated_weight[top:bottom, left:right] += weights
-                    tile_index += 1
-                    emit({
-                        "type": "progress",
-                        "stage": "lama-inpainting",
-                        "progress": 5 + int(((page_index + tile_index / max(tile_count, 1)) / len(pages)) * 90),
-                    })
+                weights = feather[:mask_crop.shape[0], None] * feather[None, :mask_crop.shape[1]]
+                weights = weights * mask_crop.astype(np.float32)
+                accumulated[top:bottom, left:right] += output[:mask_crop.shape[0], :mask_crop.shape[1]].astype(np.float32) * weights[:, :, None]
+                accumulated_weight[top:bottom, left:right] += weights
+                tile_index += 1
+                emit({
+                    "type": "progress",
+                    "stage": "lama-inpainting",
+                    "progress": 5 + int(((page_index + tile_index / max(tile_count, 1)) / len(pages)) * 90),
+                })
 
             restored = image_array.copy()
             selected = mask_array & (accumulated_weight > 0)

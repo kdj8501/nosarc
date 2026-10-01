@@ -23,7 +23,7 @@ import {
 import { createOcrWorker, extractOcrBlocks, recognizePage } from './ocr.mjs';
 import { createInpaintMask, isRenderableLetteringLayer, renderTranslatedPage } from './render.mjs';
 import { autoLetteringStyle, automaticLetteringPolygon, inferLetteringContentKind } from './lettering.mjs';
-import { isKoreanTargetLanguage, isKoreanText, translateWithOllama } from './translation.mjs';
+import { TRANSLATION_PIPELINE_VERSION, isKoreanTargetLanguage, isKoreanText, translateWithOllama } from './translation.mjs';
 
 globalThis.DOMMatrix = canvas.DOMMatrix;
 globalThis.ImageData = canvas.ImageData;
@@ -37,6 +37,7 @@ const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const LETTERING_LAYOUT_VERSION = 'balloon-interior-v3';
+const RENDER_PIPELINE_VERSION = 'original-white-cleanup-v4';
 const processingOnly = process.env.NOSARC_PROCESS_ROLE === 'worker';
 loadDotEnv(path.join(ROOT, '.env'));
 const venvPythonPath = path.join(ROOT, 'ai-worker', '.venv', process.platform === 'win32' ? 'Scripts' : 'bin', process.platform === 'win32' ? 'python.exe' : 'python');
@@ -82,6 +83,7 @@ const config = {
   aiTranslationOllamaModel: process.env.AI_TRANSLATION_OLLAMA_MODEL || 'qwen3:8b',
   aiTranslationOllamaTimeoutMs: Math.max(30_000, Number(process.env.AI_TRANSLATION_OLLAMA_TIMEOUT_MS || 300_000)),
   aiTranslationOllamaThink: ['1', 'true', 'yes'].includes(String(process.env.AI_TRANSLATION_OLLAMA_THINK || 'false').trim().toLowerCase()),
+  aiTranslationOllamaPolish: ['1', 'true', 'yes'].includes(String(process.env.AI_TRANSLATION_OLLAMA_POLISH || 'false').trim().toLowerCase()),
   aiTranslationOllamaBatchSize: Math.max(1, Number(process.env.AI_TRANSLATION_OLLAMA_BATCH_SIZE || 1)),
   aiWorkerCommand,
   aiWorkerScript: resolveFromRoot(process.env.AI_WORKER_SCRIPT || './ai-worker/worker.py'),
@@ -256,7 +258,7 @@ if (!db.prepare('PRAGMA table_info(translations)').all().some((column) => column
 }
 
 for (const [table, columns] of Object.entries({
-  pages: { processing_asset_id: 'TEXT REFERENCES assets(id)', processing_version: 'TEXT', processing_width: 'INTEGER', processing_height: 'INTEGER', render_error: 'TEXT', render_revision: 'INTEGER NOT NULL DEFAULT 0' },
+  pages: { processing_asset_id: 'TEXT REFERENCES assets(id)', processing_version: 'TEXT', processing_width: 'INTEGER', processing_height: 'INTEGER', render_error: 'TEXT', render_revision: 'INTEGER NOT NULL DEFAULT 0', render_version: 'TEXT' },
   translations: { input_hash: 'TEXT', job_id: 'TEXT' },
   jobs: { options_json: "TEXT NOT NULL DEFAULT '{}'" },
 })) {
@@ -1270,7 +1272,7 @@ async function renderChapterImages(chapterId, jobId, onProgress = () => {}) {
     onProgress(0);
     for (const page of pages) {
       if (jobId && isJobCancelled(jobId)) return false;
-      if (pageErrors.has(page.id) || (page.rendered_asset_id && !page.render_error)) continue;
+      if (pageErrors.has(page.id) || (page.rendered_asset_id && !page.render_error && page.render_version === RENDER_PIPELINE_VERSION)) continue;
       const pageLayers = layersByPage[page.id] || [];
       if (!pageLayers.length) continue;
       const maskPath = path.join(config.inpaintWorkPath, `${workToken}-${page.id}-mask.png`);
@@ -1301,11 +1303,12 @@ async function renderChapterImages(chapterId, jobId, onProgress = () => {}) {
         if (pageErrors.has(page.id)) throw new Error(pageErrors.get(page.id));
         const pageLayers = layersByPage[page.id] || [];
         if (!pageLayers.length) await clearRenderedPage(page.id);
-        else if (!page.rendered_asset_id || page.render_error) {
+        else if (!page.rendered_asset_id || page.render_error || page.render_version !== RENDER_PIPELINE_VERSION) {
           const basePath = outputs.get(page.id) || processingPagePath(page);
           const buffer = await renderTranslatedPage(basePath, pageLayers, {
             fontPath: config.letteringFontPath, inpaintPadding: config.inpaintPadding,
             skipInpaint: outputs.has(page.id),
+            originalSourcePath: processingPagePath(page),
           });
           if (jobId && isJobCancelled(jobId)) return false;
           await saveRenderedPage(page, buffer);
@@ -1351,7 +1354,7 @@ async function saveRenderedPage(page, buffer) {
         crypto.createHash('sha256').update(buffer).digest('hex'),
         now,
       );
-      db.prepare('UPDATE pages SET rendered_asset_id = ? WHERE id = ?').run(assetId, page.id);
+      db.prepare('UPDATE pages SET rendered_asset_id = ?, render_version = ? WHERE id = ?').run(assetId, RENDER_PIPELINE_VERSION, page.id);
       if (previousAsset?.id) db.prepare('DELETE FROM assets WHERE id = ?').run(previousAsset.id);
     })();
   } catch (error) {
@@ -1421,7 +1424,8 @@ async function runAutoTranslationJob(jobId) {
     }
     const inputHashes = new Map(blocks.map((block) => [block.id, crypto.createHash('sha256').update(JSON.stringify({
       source: block.source_text, context: pageContext.get(block.page_id), targetLanguage,
-      glossaryVersion, translatorId, translatorVersion, version: 'translation-checkpoint-v1', think: config.aiTranslationOllamaThink,
+      glossaryVersion, translatorId, translatorVersion, version: translatorId === 'ollama' ? TRANSLATION_PIPELINE_VERSION : 'translation-checkpoint-v1', think: config.aiTranslationOllamaThink,
+      polish: config.aiTranslationOllamaPolish,
       sourceCode: config.aiTranslationSourceCode, targetCode: config.aiTranslationTargetCode, beamSize: config.aiTranslationBeamSize,
     })).digest('hex')]));
     const existing = new Map(db.prepare(`SELECT t.* FROM translations t JOIN ocr_blocks b ON b.id = t.ocr_block_id
@@ -1514,6 +1518,7 @@ async function runAutoTranslationJob(jobId) {
         targetLanguage: chapter.target_language || 'ko',
         batchSize: config.aiTranslationOllamaBatchSize,
         think: config.aiTranslationOllamaThink,
+        skipNaturalization: !config.aiTranslationOllamaPolish,
         entityGlossary,
         timeoutMs: config.aiTranslationOllamaTimeoutMs,
         signal: controller.signal,
@@ -1553,6 +1558,7 @@ async function runAutoTranslationJob(jobId) {
           targetLanguage: chapter.target_language || 'ko',
           batchSize: 1,
           think: config.aiTranslationOllamaThink,
+          skipNaturalization: !config.aiTranslationOllamaPolish,
           entityGlossary,
           timeoutMs: config.aiTranslationOllamaTimeoutMs,
           signal: ollamaController.signal,
