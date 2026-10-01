@@ -243,7 +243,7 @@ async function startOcr(chapterId, { replaceExisting = false } = {}) {
 async function startAutoTranslate(chapterId) {
   const confirmed = window.confirm('OCR 결과를 기준으로 자동 번역과 식자 레이어를 생성합니다. 기존 번역은 새 결과로 교체됩니다. 계속할까요?');
   if (!confirmed) return;
-  const result = await request(`/api/chapters/${chapterId}/auto-translate`, { method: 'POST' });
+  const result = await request(`/api/chapters/${chapterId}/auto-translate`, { method: 'POST', body: { forceTranslation: true } });
   if (!result?.id) return;
   showNotice('자동 번역·식자 작업을 접수했습니다.');
   if (state.detailSeriesId) await openSeries(state.detailSeriesId);
@@ -282,12 +282,16 @@ function renderReader() {
   const hasBlocks = chapter.pages.some((page) => page.ocr_blocks?.length);
   $('#reader-editor-toggle').disabled = !hasBlocks;
   $('#reader-render').disabled = !hasTranslation;
-  $('#reader-notice').textContent = chapter.pages.length ? activeMode === 'translated' ? '원문을 제거하고 번역문을 이미지에 렌더링했습니다.' : '원본 페이지를 표시하고 있습니다.' : '아직 변환된 페이지가 없습니다.';
+  const failedPages = chapter.pages.filter((page) => page.render_error).length;
+  $('#reader-notice').textContent = chapter.pages.length ? activeMode === 'translated'
+    ? failedPages ? `식자가 필요한 ${failedPages}페이지는 원본으로 표시합니다. 번역 편집 후 이미지 렌더링을 다시 실행해 주세요.` : '번역 이미지를 표시합니다. 편집한 페이지는 이미지 렌더링을 다시 실행해 주세요.'
+    : '원본 페이지를 표시하고 있습니다.' : '아직 변환된 페이지가 없습니다.';
   $('#reader-stage').innerHTML = chapter.pages.length ? chapter.pages.map((page) => {
     const rendered = activeMode === 'translated' && page.translated_media_url;
-    const layers = activeMode === 'translated' && !rendered ? (page.lettering_layers || []).map(renderLetteringLayer).join('') : '';
+    const layers = activeMode === 'translated' && !rendered && !page.render_error ? (page.lettering_layers || []).map(renderLetteringLayer).join('') : '';
     const mediaUrl = rendered ? page.translated_media_url : page.media_url;
-    return `<figure class="reader-page"><div class="reader-canvas"><img src="${mediaUrl}" alt="${escapeHtml(chapter.number_label)} 페이지 ${page.page_index + 1}" loading="lazy" />${layers}</div><figcaption>${page.page_index + 1} / ${chapter.pages.length}</figcaption></figure>`;
+    const warning = activeMode === 'translated' && page.render_error ? ` · 수정 필요: ${escapeHtml(page.render_error)}` : '';
+    return `<figure class="reader-page"><div class="reader-canvas"><img src="${mediaUrl}" alt="${escapeHtml(chapter.number_label)} 페이지 ${page.page_index + 1}" loading="lazy" />${layers}</div><figcaption>${page.page_index + 1} / ${chapter.pages.length}${warning}</figcaption></figure>`;
   }).join('') : '<div class="reader-empty"><p>페이지가 준비되면 이곳에서 읽을 수 있습니다.</p></div>';
   renderTranslationEditor();
 }
@@ -425,7 +429,7 @@ async function watchReaderRender(jobId) {
     if (job.status === 'completed') {
       state.reader.chapter = await request(`/api/chapters/${state.reader.chapter.id}`);
       renderReader();
-      showNotice('번역 이미지 렌더링이 완료되었습니다.');
+      showNotice(job.error_message || '번역 이미지 렌더링이 완료되었습니다.', Boolean(job.error_message));
     } else if (job.status === 'failed') {
       showNotice(`이미지 렌더링 실패: ${job.error_message || '원인을 확인해 주세요.'}`, true);
     }

@@ -19,6 +19,37 @@ def emit(payload: dict[str, Any]) -> None:
     sys.stdout.buffer.flush()
 
 
+def prepare_images(request: dict[str, Any]) -> None:
+    from PIL import Image
+    import math
+
+    max_side = max(512, int(request.get("maxSide", 2000)))
+    max_pixels = max(262144, int(request.get("maxPixels", 4000000)))
+    max_source_pixels = max(max_pixels, int(request.get("maxSourcePixels", 80000000)))
+    Image.MAX_IMAGE_PIXELS = max_source_pixels
+    pages = request.get("pages", [])
+    for index, page in enumerate(pages):
+        try:
+            with Image.open(page["imagePath"]) as source:
+                width, height = source.size
+                if width <= 0 or height <= 0 or width * height > max_source_pixels:
+                    raise RuntimeError(f"이미지 픽셀 수가 제한({max_source_pixels:,})을 초과했습니다.")
+                scale = min(1.0, max_side / max(width, height), math.sqrt(max_pixels / (width * height)))
+                output_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+                # JPEG draft decoding reduces memory before the full RGB conversion.
+                source.draft("RGB", output_size)
+                image = source.convert("RGB")
+                if image.size != output_size:
+                    image = image.resize(output_size, Image.Resampling.LANCZOS)
+                image.save(page["outputPath"], format="PNG")
+                emit({"type": "prepared_result", "pageId": page["pageId"],
+                      "outputPath": page["outputPath"], "width": output_size[0], "height": output_size[1]})
+        except Exception as error:
+            emit({"type": "prepare_error", "pageId": page["pageId"], "message": str(error)[:500]})
+        emit({"type": "progress", "progress": int((index + 1) / max(1, len(pages)) * 100)})
+    emit({"type": "done", "progress": 100})
+
+
 def translate(request: dict[str, Any]) -> None:
     try:
         import ctranslate2
@@ -227,88 +258,92 @@ def inpaint_lama(request: dict[str, Any]) -> None:
     emit({"type": "progress", "stage": "lama-model-loaded", "progress": 5})
 
     for page_index, page in enumerate(pages):
-        image_path = str(page.get("imagePath", ""))
-        mask_path = str(page.get("maskPath", ""))
-        output_path = str(page.get("outputPath", ""))
-        if not os.path.isfile(image_path):
-            raise RuntimeError(f"LaMa 입력 이미지를 읽을 수 없습니다: {image_path}")
-        if not os.path.isfile(mask_path):
-            raise RuntimeError(f"LaMa 마스크를 읽을 수 없습니다: {mask_path}")
-        with Image.open(image_path) as source:
-            image = source.convert("RGB")
-        with Image.open(mask_path) as source_mask:
-            mask = source_mask.convert("L")
-        image_array = np.asarray(image, dtype=np.uint8)
-        mask_array = (np.asarray(mask, dtype=np.uint8) > 0)
-        image_height, image_width = mask_array.shape
-        tile_size = 512
-        tile_step = 448
+        try:
+            image_path = str(page.get("imagePath", ""))
+            mask_path = str(page.get("maskPath", ""))
+            output_path = str(page.get("outputPath", ""))
+            if not os.path.isfile(image_path):
+                raise RuntimeError(f"LaMa 입력 이미지를 읽을 수 없습니다: {image_path}")
+            if not os.path.isfile(mask_path):
+                raise RuntimeError(f"LaMa 마스크를 읽을 수 없습니다: {mask_path}")
+            with Image.open(image_path) as source:
+                image = source.convert("RGB")
+            with Image.open(mask_path) as source_mask:
+                mask = source_mask.convert("L")
+            image_array = np.asarray(image, dtype=np.uint8)
+            mask_array = (np.asarray(mask, dtype=np.uint8) > 0)
+            image_height, image_width = mask_array.shape
+            tile_size = 512
+            tile_step = 448
 
-        def tile_starts(length: int) -> list[int]:
-            starts = [0]
-            while starts[-1] + tile_size < length:
-                starts.append(starts[-1] + tile_step)
-            return starts
+            def tile_starts(length: int) -> list[int]:
+                starts = [0]
+                while starts[-1] + tile_size < length:
+                    starts.append(starts[-1] + tile_step)
+                return starts
 
-        x_starts = tile_starts(image_width)
-        y_starts = tile_starts(image_height)
-        tile_count = sum(
-            bool(mask_array[top:min(top + tile_size, image_height), left:min(left + tile_size, image_width)].any())
-            for top in y_starts for left in x_starts
-        )
-        accumulated = np.zeros((image_height, image_width, 3), dtype=np.float32)
-        accumulated_weight = np.zeros((image_height, image_width), dtype=np.float32)
-        axis = np.minimum(np.arange(tile_size) + 1, tile_size - np.arange(tile_size)).astype(np.float32)
-        feather = np.clip(axis / 32.0, 0.05, 1.0)
-        tile_index = 0
+            x_starts = tile_starts(image_width)
+            y_starts = tile_starts(image_height)
+            tile_count = sum(
+                bool(mask_array[top:min(top + tile_size, image_height), left:min(left + tile_size, image_width)].any())
+                for top in y_starts for left in x_starts
+            )
+            accumulated = np.zeros((image_height, image_width, 3), dtype=np.float32)
+            accumulated_weight = np.zeros((image_height, image_width), dtype=np.float32)
+            axis = np.minimum(np.arange(tile_size) + 1, tile_size - np.arange(tile_size)).astype(np.float32)
+            feather = np.clip(axis / 32.0, 0.05, 1.0)
+            tile_index = 0
 
-        for top in y_starts:
-            for left in x_starts:
-                bottom = min(top + tile_size, image_height)
-                right = min(left + tile_size, image_width)
-                mask_crop = mask_array[top:bottom, left:right]
-                if not mask_crop.any():
-                    continue
+            for top in y_starts:
+                for left in x_starts:
+                    bottom = min(top + tile_size, image_height)
+                    right = min(left + tile_size, image_width)
+                    mask_crop = mask_array[top:bottom, left:right]
+                    if not mask_crop.any():
+                        continue
 
-                image_crop = image_array[top:bottom, left:right]
-                pad_y = tile_size - image_crop.shape[0]
-                pad_x = tile_size - image_crop.shape[1]
-                image_tile = np.pad(image_crop, ((0, pad_y), (0, pad_x), (0, 0)), mode="reflect")
-                mask_tile = np.zeros((tile_size, tile_size), dtype=np.float32)
-                mask_tile[:mask_crop.shape[0], :mask_crop.shape[1]] = mask_crop.astype(np.float32)
-                image_tensor = np.transpose(image_tile[:, :, ::-1].astype(np.float32) / 255.0, (2, 0, 1))[None, ...]
-                model_mask = (mask_tile > 0).astype(np.float32)[None, None, ...]
-                output = model.run(["output"], {"image": image_tensor, "mask": model_mask})[0][0]
-                output = np.transpose(output, (1, 2, 0))
-                if float(output.max()) <= 1.5:
-                    output = output * 255.0
-                output = np.clip(output, 0, 255).astype(np.uint8)[:, :, ::-1]
+                    image_crop = image_array[top:bottom, left:right]
+                    pad_y = tile_size - image_crop.shape[0]
+                    pad_x = tile_size - image_crop.shape[1]
+                    image_tile = np.pad(image_crop, ((0, pad_y), (0, pad_x), (0, 0)), mode="reflect")
+                    mask_tile = np.zeros((tile_size, tile_size), dtype=np.float32)
+                    mask_tile[:mask_crop.shape[0], :mask_crop.shape[1]] = mask_crop.astype(np.float32)
+                    image_tensor = np.transpose(image_tile[:, :, ::-1].astype(np.float32) / 255.0, (2, 0, 1))[None, ...]
+                    model_mask = (mask_tile > 0).astype(np.float32)[None, None, ...]
+                    output = model.run(["output"], {"image": image_tensor, "mask": model_mask})[0][0]
+                    output = np.transpose(output, (1, 2, 0))
+                    if float(output.max()) <= 1.5:
+                        output = output * 255.0
+                    output = np.clip(output, 0, 255).astype(np.uint8)[:, :, ::-1]
 
-                weights = feather[:mask_crop.shape[0], None] * feather[None, :mask_crop.shape[1]]
-                weights = weights * mask_crop.astype(np.float32)
-                accumulated[top:bottom, left:right] += output[:mask_crop.shape[0], :mask_crop.shape[1]].astype(np.float32) * weights[:, :, None]
-                accumulated_weight[top:bottom, left:right] += weights
-                tile_index += 1
-                emit({
-                    "type": "progress",
-                    "stage": "lama-inpainting",
-                    "progress": 5 + int(((page_index + tile_index / max(tile_count, 1)) / len(pages)) * 90),
-                })
+                    weights = feather[:mask_crop.shape[0], None] * feather[None, :mask_crop.shape[1]]
+                    weights = weights * mask_crop.astype(np.float32)
+                    accumulated[top:bottom, left:right] += output[:mask_crop.shape[0], :mask_crop.shape[1]].astype(np.float32) * weights[:, :, None]
+                    accumulated_weight[top:bottom, left:right] += weights
+                    tile_index += 1
+                    emit({
+                        "type": "progress",
+                        "stage": "lama-inpainting",
+                        "progress": 5 + int(((page_index + tile_index / max(tile_count, 1)) / len(pages)) * 90),
+                    })
 
-        restored = image_array.copy()
-        selected = mask_array & (accumulated_weight > 0)
-        restored[selected] = np.clip(
-            accumulated[selected] / accumulated_weight[selected, None], 0, 255
-        ).astype(np.uint8)
-        output_image = Image.fromarray(restored, mode="RGB")
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        output_image.save(output_path, format="PNG")
-        emit({
-            "type": "inpaint_result",
-            "pageId": str(page.get("pageId", "")),
-            "outputPath": output_path,
-            "progress": 5 + int(((page_index + 1) / len(pages)) * 90),
-        })
+            restored = image_array.copy()
+            selected = mask_array & (accumulated_weight > 0)
+            restored[selected] = np.clip(
+                accumulated[selected] / accumulated_weight[selected, None], 0, 255
+            ).astype(np.uint8)
+            output_image = Image.fromarray(restored, mode="RGB")
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            output_image.save(output_path, format="PNG")
+            emit({
+                "type": "inpaint_result",
+                "pageId": str(page.get("pageId", "")),
+                "outputPath": output_path,
+                "progress": 5 + int(((page_index + 1) / len(pages)) * 90),
+            })
+        except Exception as error:
+            emit({"type": "inpaint_error", "pageId": str(page.get("pageId", "")), "message": str(error)[:500]})
+            emit({"type": "progress", "stage": "lama-inpainting", "progress": 5 + int(((page_index + 1) / len(pages)) * 90)})
     emit({"type": "done", "progress": 100})
 
 
@@ -318,7 +353,9 @@ def main() -> int:
             continue
         try:
             request = json.loads(raw_line.decode("utf-8"))
-            if request.get("kind", "translate") == "ocr":
+            if request.get("kind") == "prepare":
+                prepare_images(request)
+            elif request.get("kind", "translate") == "ocr":
                 recognize_manga(request)
             elif request.get("kind") == "detect":
                 detect_comic_text(request)

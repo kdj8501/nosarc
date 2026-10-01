@@ -6,6 +6,7 @@ data/*.db
 data/*.db-*
 data/media/
 data/uploads/
+data/inpaint/
 data/tesseract/
 data/models/
 ai-worker/.venv/

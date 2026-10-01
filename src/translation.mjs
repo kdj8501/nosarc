@@ -102,6 +102,7 @@ export async function translateWithOllama(blocks, {
   fetchImpl = globalThis.fetch,
   isCancelled = () => false,
   onProgress = () => {},
+  onResult = () => {},
   entityGlossary = new Map(),
   strictTargetLanguageRetry = false,
   strictJsonRetry = false,
@@ -241,6 +242,7 @@ export async function translateWithOllama(blocks, {
         const recovered = await retryInSmallerBatches(items);
         if (isCancelled()) break batchLoop;
         if (recovered) {
+          for (const item of items) onResult(item.index, results[item.index]);
           completed += items.length;
           firstPassProgress(Math.round(completed / blocks.length * 100));
           continue batchLoop;
@@ -255,6 +257,7 @@ export async function translateWithOllama(blocks, {
         const recovered = await retryInSmallerBatches(items);
         if (isCancelled()) break batchLoop;
         if (recovered) {
+          for (const item of items) onResult(item.index, results[item.index]);
           completed += items.length;
           firstPassProgress(Math.round(completed / blocks.length * 100));
           continue batchLoop;
@@ -270,6 +273,7 @@ export async function translateWithOllama(blocks, {
           const recovered = await retryInSmallerBatches(items);
           if (isCancelled()) break batchLoop;
           if (recovered) {
+            for (const item of items) onResult(item.index, results[item.index]);
             completed += items.length;
             firstPassProgress(Math.round(completed / blocks.length * 100));
             continue batchLoop;
@@ -314,6 +318,7 @@ export async function translateWithOllama(blocks, {
         ? kind
         : 'unknown';
       results[index] = { text, kind: normalizedKind };
+      onResult(index, results[index]);
     }
     completed += items.length;
     firstPassProgress(Math.round(completed / blocks.length * 100));
@@ -330,7 +335,10 @@ export async function translateWithOllama(blocks, {
       if (isCancelled()) break;
       if (polishedItems) {
         for (const [index, text] of polishedItems) {
-          if (hasKoreanOutput(text)) results[index] = { ...results[index], text };
+          if (hasKoreanOutput(text)) {
+            results[index] = { ...results[index], text };
+            onResult(index, results[index]);
+          }
         }
       }
       polished += items.length;

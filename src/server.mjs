@@ -37,6 +37,7 @@ const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const LETTERING_LAYOUT_VERSION = 'balloon-interior-v3';
+const processingOnly = process.env.NOSARC_PROCESS_ROLE === 'worker';
 loadDotEnv(path.join(ROOT, '.env'));
 const venvPythonPath = path.join(ROOT, 'ai-worker', '.venv', process.platform === 'win32' ? 'Scripts' : 'bin', process.platform === 'win32' ? 'python.exe' : 'python');
 const configuredWorkerCommand = String(process.env.AI_WORKER_COMMAND || '').trim();
@@ -58,6 +59,9 @@ const config = {
   maxPageBytes: Number(process.env.MAX_PAGE_BYTES || 67108864),
   maxExtractedBytes: Number(process.env.MAX_EXTRACTED_BYTES || 536870912),
   pdfRenderWidth: Number(process.env.PDF_RENDER_WIDTH || 1600),
+  processingMaxSide: Math.max(512, Number(process.env.PROCESSING_MAX_SIDE || 2000)),
+  processingMaxPixels: Math.max(262144, Number(process.env.PROCESSING_MAX_PIXELS || 4000000)),
+  maxSourcePixels: Math.max(4000000, Number(process.env.MAX_SOURCE_PIXELS || 80000000)),
   ocrProvider: process.env.OCR_PROVIDER || 'manga-ocr',
   ocrLanguage: process.env.OCR_LANGUAGE || 'jpn',
   ocrLangPath: process.env.OCR_LANG_PATH || '',
@@ -251,24 +255,21 @@ if (!db.prepare('PRAGMA table_info(translations)').all().some((column) => column
   db.exec('ALTER TABLE translations ADD COLUMN content_kind TEXT');
 }
 
+for (const [table, columns] of Object.entries({
+  pages: { processing_asset_id: 'TEXT REFERENCES assets(id)', processing_version: 'TEXT', processing_width: 'INTEGER', processing_height: 'INTEGER', render_error: 'TEXT', render_revision: 'INTEGER NOT NULL DEFAULT 0' },
+  translations: { input_hash: 'TEXT', job_id: 'TEXT' },
+  jobs: { options_json: "TEXT NOT NULL DEFAULT '{}'" },
+})) {
+  const existing = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name));
+  for (const [name, definition] of Object.entries(columns)) {
+    if (!existing.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+  }
+}
+db.pragma('busy_timeout = 5000');
+
 const sessions = new Map();
-let processingTaskQueue = Promise.resolve();
-const ingestQueue = [];
-let ingestActive = false;
-const ocrQueue = [];
-let ocrActive = false;
-const autoTranslationQueue = [];
-let autoTranslationActive = false;
-const renderQueue = [];
-let renderActive = false;
 const activeAiProcesses = new Map();
 const activeOcrWorkers = new Map();
-
-function runInProcessingTaskQueue(task) {
-  const next = processingTaskQueue.then(task, task);
-  processingTaskQueue = next.catch(() => undefined);
-  return next;
-}
 
 const app = express();
 app.disable('x-powered-by');
@@ -519,8 +520,7 @@ app.post('/api/series/:id/chapters', upload.array('files', config.maxPages), asy
         .run(crypto.randomUUID(), chapterId, index, asset.id, asset.width, asset.height);
     }
     db.prepare('UPDATE series SET updated_at = ? WHERE id = ?').run(new Date().toISOString(), series.id);
-    if (jobId) enqueueIngest(jobId);
-    else jobId = queueOcrJob(chapterId);
+    if (!jobId) jobId = queueOcrJob(chapterId);
     res.status(202).json({ id: chapterId, status, job_id: jobId, chapter: getChapter(chapterId) });
   } catch (error) {
     next(error);
@@ -555,12 +555,12 @@ app.post('/api/chapters/:id/ocr', (req, res) => {
   if (!chapter) return res.status(404).json({ error: '권을 찾을 수 없습니다.' });
   if (!['tesseract', 'manga-ocr'].includes(config.ocrProvider)) return res.status(503).json({ error: `현재 OCR 제공자(${config.ocrProvider})는 사용할 수 없습니다.` });
   if (chapter.page_count < 1) return res.status(409).json({ error: 'OCR을 실행할 페이지가 없습니다.' });
-  const activeJob = db.prepare(`SELECT * FROM jobs WHERE chapter_id = ? AND type = 'ocr' AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`).get(chapter.id);
-  if (activeJob) return res.status(409).json({ error: '이미 OCR 작업이 진행 중입니다.', job_id: activeJob.id });
+  const activeJob = db.prepare(`SELECT * FROM jobs WHERE chapter_id = ? AND type IN ('ocr', 'auto_translate', 'render') AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`).get(chapter.id);
+  if (activeJob) return res.status(409).json({ error: '이 권의 다른 작업이 진행 중입니다.', job_id: activeJob.id });
   const jobId = crypto.randomUUID();
   const now = new Date().toISOString();
   db.prepare(`INSERT INTO jobs (id, chapter_id, type, status, current_stage, progress, created_at) VALUES (?, ?, 'ocr', 'queued', 'ocr', 0, ?)`).run(jobId, chapter.id, now);
-  enqueueOcr(jobId);
+
   res.status(202).json({ id: jobId, status: 'queued' });
 });
 
@@ -571,12 +571,13 @@ app.post('/api/chapters/:id/auto-translate', (req, res) => {
   if (chapter.page_count < 1 || chapter.processing_status !== 'completed') return res.status(409).json({ error: '페이지 변환이 완료된 권에서만 자동 번역을 실행할 수 있습니다.' });
   const blockCount = db.prepare(`SELECT COUNT(*) AS count FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ?`).get(chapter.id).count;
   if (!blockCount) return res.status(409).json({ error: '먼저 OCR을 실행해 번역할 텍스트를 만들어 주세요.' });
-  const activeJob = db.prepare(`SELECT * FROM jobs WHERE chapter_id = ? AND type IN ('auto_translate', 'render') AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`).get(chapter.id);
+  const activeJob = db.prepare(`SELECT * FROM jobs WHERE chapter_id = ? AND type IN ('ocr', 'auto_translate', 'render') AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`).get(chapter.id);
   if (activeJob) return res.status(409).json({ error: '이미 자동 번역 작업이 진행 중입니다.', job_id: activeJob.id });
   const jobId = crypto.randomUUID();
   const now = new Date().toISOString();
-  db.prepare(`INSERT INTO jobs (id, chapter_id, type, status, current_stage, progress, created_at) VALUES (?, ?, 'auto_translate', 'queued', 'translation', 0, ?)`).run(jobId, chapter.id, now);
-  enqueueAutoTranslation(jobId);
+  db.prepare(`INSERT INTO jobs (id, chapter_id, type, status, current_stage, progress, created_at, options_json) VALUES (?, ?, 'auto_translate', 'queued', 'translation', 0, ?, ?)`)
+    .run(jobId, chapter.id, now, JSON.stringify({ forceTranslation: req.body?.forceTranslation === true }));
+
   res.status(202).json({ id: jobId, type: 'auto_translate', status: 'queued' });
 });
 
@@ -585,12 +586,12 @@ app.post('/api/chapters/:id/render', (req, res) => {
   if (!chapter) return res.status(404).json({ error: '권을 찾을 수 없습니다.' });
   const layerCount = db.prepare(`SELECT COUNT(*) AS count FROM lettering_layers l JOIN pages p ON p.id = l.page_id WHERE p.chapter_id = ? AND l.is_active = 1`).get(chapter.id).count;
   if (!layerCount) return res.status(409).json({ error: '먼저 번역문을 저장해 주세요.' });
-  const activeJob = db.prepare(`SELECT * FROM jobs WHERE chapter_id = ? AND type IN ('auto_translate', 'render') AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`).get(chapter.id);
+  const activeJob = db.prepare(`SELECT * FROM jobs WHERE chapter_id = ? AND type IN ('ocr', 'auto_translate', 'render') AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`).get(chapter.id);
   if (activeJob) return res.status(409).json({ error: '이미 이미지 렌더링 작업이 진행 중입니다.', job_id: activeJob.id });
   const jobId = crypto.randomUUID();
   const now = new Date().toISOString();
   db.prepare(`INSERT INTO jobs (id, chapter_id, type, status, current_stage, progress, created_at) VALUES (?, ?, 'render', 'queued', 'rendering', 0, ?)`).run(jobId, chapter.id, now);
-  enqueueRender(jobId);
+
   res.status(202).json({ id: jobId, type: 'render', status: 'queued' });
 });
 
@@ -745,15 +746,13 @@ app.post('/api/jobs/:id/retry', (req, res) => {
   const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(req.params.id);
   if (!job) return res.status(404).json({ error: '작업을 찾을 수 없습니다.' });
   if (!['failed', 'cancelled'].includes(job.status)) return res.status(409).json({ error: '실패하거나 취소된 작업만 재시도할 수 있습니다.' });
+  const otherJob = db.prepare("SELECT id FROM jobs WHERE chapter_id = ? AND id <> ? AND status IN ('queued', 'running') LIMIT 1").get(job.chapter_id, job.id);
+  if (otherJob) return res.status(409).json({ error: '이 권의 다른 작업이 진행 중입니다.', job_id: otherJob.id });
   const now = new Date().toISOString();
   db.transaction(() => {
     db.prepare(`UPDATE jobs SET status = 'queued', current_stage = ?, progress = 0, error_message = NULL, started_at = NULL, finished_at = NULL WHERE id = ?`).run(job.type === 'ocr' ? 'ocr' : job.type === 'auto_translate' ? 'translation' : job.type === 'render' ? 'rendering' : 'preparing', job.id);
     if (job.type === 'ingest') db.prepare(`UPDATE chapters SET processing_status = 'queued', updated_at = ? WHERE id = ?`).run(now, job.chapter_id);
   })();
-  if (job.type === 'ocr') enqueueOcr(job.id);
-  else if (job.type === 'auto_translate') enqueueAutoTranslation(job.id);
-  else if (job.type === 'render') enqueueRender(job.id);
-  else enqueueIngest(job.id);
   res.status(202).json({ id: job.id, status: 'queued' });
 });
 
@@ -793,10 +792,61 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ error: '서버 오류가 발생했습니다.' });
 });
 
-const server = app.listen(config.port, () => {
-  console.log(`${config.appName} listening on http://localhost:${config.port}`);
+let server;
+let processingChild;
+let workerTimer;
+let restartTimer;
+let shuttingDown = false;
+let workerBusy = false;
+
+if (processingOnly) {
   recoverJobs();
-});
+  workerTimer = setInterval(() => {
+    for (const [jobId, child] of activeAiProcesses) {
+      if (isJobCancelled(jobId)) child.kill();
+    }
+    for (const [jobId, worker] of activeOcrWorkers) {
+      if (isJobCancelled(jobId)) void worker.terminate().catch(() => undefined);
+    }
+    void pollProcessingJobs();
+  }, 500);
+  void pollProcessingJobs();
+} else {
+  server = app.listen(config.port, () => {
+    console.log(`${config.appName} listening on http://localhost:${server.address().port}`);
+    startProcessingChild();
+  });
+}
+
+function startProcessingChild() {
+  if (shuttingDown) return;
+  processingChild = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+    cwd: ROOT, windowsHide: true, stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+    env: { ...process.env, NOSARC_PROCESS_ROLE: 'worker' },
+  });
+  processingChild.on('error', (error) => console.error('Processing worker:', error.message));
+  processingChild.on('exit', () => {
+    processingChild = null;
+    if (!shuttingDown) restartTimer = setTimeout(startProcessingChild, 2000);
+  });
+}
+
+async function pollProcessingJobs() {
+  if (workerBusy || shuttingDown) return;
+  const job = db.prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1").get();
+  if (!job) return;
+  workerBusy = true;
+  try {
+    const run = { ingest: runIngestJob, ocr: runOcrJob, auto_translate: runAutoTranslationJob, render: runRenderJob }[job.type];
+    if (!run) throw new Error(`Unsupported job type: ${job.type}`);
+    await run(job.id);
+  } catch (error) {
+    if (!isJobCancelled(job.id)) db.prepare("UPDATE jobs SET status = 'failed', current_stage = 'failed', error_message = ?, finished_at = ? WHERE id = ?")
+      .run(String(error.message).slice(0, 500), new Date().toISOString(), job.id);
+  } finally {
+    workerBusy = false;
+  }
+}
 
 function requireSession(req, res, next) {
   if (getSession(req)) return next();
@@ -865,18 +915,20 @@ function listChapterIds(seriesId) {
 
 function collectChapterAssets(chapterId) {
   return db.prepare(`SELECT DISTINCT a.* FROM assets a WHERE a.id IN (
-    SELECT source_asset_id FROM chapters WHERE id = ?
-    UNION SELECT image_asset_id FROM pages WHERE chapter_id = ?
-    UNION SELECT rendered_asset_id FROM pages WHERE chapter_id = ?
-  )`).all(chapterId, chapterId, chapterId);
+    SELECT source_asset_id FROM chapters WHERE id = @id
+    UNION SELECT image_asset_id FROM pages WHERE chapter_id = @id
+    UNION SELECT rendered_asset_id FROM pages WHERE chapter_id = @id
+    UNION SELECT processing_asset_id FROM pages WHERE chapter_id = @id
+  )`).all({ id: chapterId });
 }
 
 function collectSeriesAssets(seriesId) {
   return db.prepare(`SELECT DISTINCT a.* FROM assets a WHERE a.id IN (
-    SELECT source_asset_id FROM chapters WHERE series_id = ?
-    UNION SELECT p.image_asset_id FROM pages p JOIN chapters c ON c.id = p.chapter_id WHERE c.series_id = ?
-    UNION SELECT p.rendered_asset_id FROM pages p JOIN chapters c ON c.id = p.chapter_id WHERE c.series_id = ?
-  )`).all(seriesId, seriesId, seriesId);
+    SELECT source_asset_id FROM chapters WHERE series_id = @id
+    UNION SELECT p.image_asset_id FROM pages p JOIN chapters c ON c.id = p.chapter_id WHERE c.series_id = @id
+    UNION SELECT p.rendered_asset_id FROM pages p JOIN chapters c ON c.id = p.chapter_id WHERE c.series_id = @id
+    UNION SELECT p.processing_asset_id FROM pages p JOIN chapters c ON c.id = p.chapter_id WHERE c.series_id = @id
+  )`).all({ id: seriesId });
 }
 
 function cancelJobsForChapters(chapterIds) {
@@ -886,20 +938,9 @@ function cancelJobsForChapters(chapterIds) {
   const now = new Date().toISOString();
   for (const job of jobs) {
     db.prepare(`UPDATE jobs SET status = 'cancelled', current_stage = 'cancelled', finished_at = ? WHERE id = ?`).run(now, job.id);
-    removeQueuedJob(ingestQueue, job.id);
-    removeQueuedJob(ocrQueue, job.id);
-    removeQueuedJob(autoTranslationQueue, job.id);
-    removeQueuedJob(renderQueue, job.id);
+
     activeAiProcesses.get(job.id)?.kill();
     void activeOcrWorkers.get(job.id)?.terminate().catch(() => undefined);
-  }
-}
-
-function removeQueuedJob(queue, jobId) {
-  let index = queue.indexOf(jobId);
-  while (index !== -1) {
-    queue.splice(index, 1);
-    index = queue.indexOf(jobId);
   }
 }
 
@@ -994,32 +1035,14 @@ function groupBy(rows, key) {
   }, {});
 }
 
-function enqueueOcr(jobId) {
-  if (!ocrQueue.includes(jobId)) ocrQueue.push(jobId);
-  void drainOcrQueue();
-}
-
 function queueOcrJob(chapterId) {
   const activeJob = db.prepare(`SELECT id FROM jobs WHERE chapter_id = ? AND type = 'ocr' AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`).get(chapterId);
   if (activeJob) return activeJob.id;
   const jobId = crypto.randomUUID();
   db.prepare(`INSERT INTO jobs (id, chapter_id, type, status, current_stage, progress, created_at)
     VALUES (?, ?, 'ocr', 'queued', 'ocr', 0, ?)`).run(jobId, chapterId, new Date().toISOString());
-  enqueueOcr(jobId);
-  return jobId;
-}
 
-async function drainOcrQueue() {
-  if (ocrActive) return;
-  ocrActive = true;
-  try {
-    while (ocrQueue.length) {
-      const jobId = ocrQueue.shift();
-      await runInProcessingTaskQueue(() => runOcrJob(jobId));
-    }
-  } finally {
-    ocrActive = false;
-  }
+  return jobId;
 }
 
 async function runOcrJob(jobId) {
@@ -1033,6 +1056,9 @@ async function runOcrJob(jobId) {
     .run(new Date().toISOString(), jobId);
   let worker;
   try {
+    await prepareChapterImages(job.chapter_id, jobId);
+    if (isJobCancelled(jobId)) return;
+    await attachProcessingAssets(pages);
     const detections = [];
     if (config.ocrProvider === 'manga-ocr') {
       const blocksByPage = await runComicTextDetectorWorker(jobId, pages, (progress) => {
@@ -1049,7 +1075,7 @@ async function runOcrJob(jobId) {
       activeOcrWorkers.set(jobId, worker);
       for (const [index, page] of pages.entries()) {
         if (isJobCancelled(jobId)) return;
-        const data = await recognizePage(worker, assetPath(page));
+        const data = await recognizePage(worker, processingPagePath(page));
         const blocks = extractOcrBlocks(data, page.width || 1, page.height || 1, { minConfidence: config.ocrMinConfidence });
         detections.push({ page, blocks });
         db.prepare('UPDATE jobs SET current_stage = ?, progress = ? WHERE id = ?').run(
@@ -1122,11 +1148,6 @@ async function failOcrJob(jobId, message) {
   db.prepare(`UPDATE jobs SET status = 'failed', current_stage = 'failed', error_message = ?, finished_at = ? WHERE id = ?`).run(String(message).slice(0, 500), new Date().toISOString(), jobId);
 }
 
-function enqueueAutoTranslation(jobId) {
-  if (!autoTranslationQueue.includes(jobId)) autoTranslationQueue.push(jobId);
-  void drainAutoTranslationQueue();
-}
-
 function queueAutoTranslationJob(chapterId) {
   const blockCount = db.prepare(`SELECT COUNT(*) AS count FROM ocr_blocks b JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ?`).get(chapterId).count;
   if (!blockCount) return null;
@@ -1135,7 +1156,7 @@ function queueAutoTranslationJob(chapterId) {
   const jobId = crypto.randomUUID();
   db.prepare(`INSERT INTO jobs (id, chapter_id, type, status, current_stage, progress, created_at)
     VALUES (?, ?, 'auto_translate', 'queued', 'translation', 0, ?)`).run(jobId, chapterId, new Date().toISOString());
-  enqueueAutoTranslation(jobId);
+
   return jobId;
 }
 
@@ -1146,41 +1167,68 @@ function recoverJobs() {
       db.prepare(`UPDATE jobs SET status = 'queued', current_stage = ?, progress = 0, started_at = NULL WHERE id = ?`)
         .run(job.type === 'ocr' ? 'ocr' : job.type === 'auto_translate' ? 'translation' : job.type === 'render' ? 'rendering' : 'preparing', job.id);
     }
-    if (job.type === 'ocr') enqueueOcr(job.id);
-    else if (job.type === 'auto_translate') enqueueAutoTranslation(job.id);
-    else if (job.type === 'render') enqueueRender(job.id);
-    else enqueueIngest(job.id);
   }
 }
 
-async function drainAutoTranslationQueue() {
-  if (autoTranslationActive) return;
-  autoTranslationActive = true;
-  try {
-    while (autoTranslationQueue.length) {
-      const jobId = autoTranslationQueue.shift();
-      await runInProcessingTaskQueue(() => runAutoTranslationJob(jobId));
-    }
-  } finally {
-    autoTranslationActive = false;
+function processingPagePath(page) {
+  return assetPath({ storage_key: page.processing_storage_key || page.storage_key });
+}
+
+async function attachProcessingAssets(pages) {
+  const find = db.prepare(`SELECT a.storage_key, p.processing_width, p.processing_height FROM pages p
+    LEFT JOIN assets a ON a.id = p.processing_asset_id WHERE p.id = ?`);
+  for (const page of pages) {
+    const processing = find.get(page.id);
+    page.processing_storage_key = processing?.storage_key;
+    if (processing?.processing_width) page.width = processing.processing_width;
+    if (processing?.processing_height) page.height = processing.processing_height;
   }
 }
 
-function enqueueRender(jobId) {
-  if (!renderQueue.includes(jobId)) renderQueue.push(jobId);
-  void drainRenderQueue();
-}
-
-async function drainRenderQueue() {
-  if (renderActive) return;
-  renderActive = true;
+async function prepareChapterImages(chapterId, jobId, { toleratePageErrors = false } = {}) {
+  const version = `processing-v1:${config.processingMaxSide}:${config.processingMaxPixels}:${config.maxSourcePixels}`;
+  const pages = db.prepare(`SELECT p.*, a.storage_key, pa.storage_key AS processing_storage_key FROM pages p
+    JOIN assets a ON a.id = p.image_asset_id LEFT JOIN assets pa ON pa.id = p.processing_asset_id
+    WHERE p.chapter_id = ? ORDER BY p.page_index`).all(chapterId);
+  const pending = pages.filter((page) => page.processing_version !== version
+    || !page.processing_storage_key || !fs.existsSync(processingPagePath(page)));
+  const errors = new Map();
+  if (!pending.length) return errors;
+  const token = crypto.randomUUID();
+  const requests = pending.map((page) => ({ pageId: page.id, imagePath: assetPath(page),
+    outputPath: path.join(config.inpaintWorkPath, `${token}-${page.id}-processing.png`) }));
+  const prepared = new Map();
   try {
-    while (renderQueue.length) {
-      const jobId = renderQueue.shift();
-      await runInProcessingTaskQueue(() => runRenderJob(jobId));
+    await runAiWorkerProcess(jobId, { kind: 'prepare', pages: requests,
+      maxSide: config.processingMaxSide, maxPixels: config.processingMaxPixels, maxSourcePixels: config.maxSourcePixels,
+    }, (event) => {
+      if (event.type === 'prepared_result') prepared.set(event.pageId, event);
+      if (event.type === 'prepare_error') errors.set(event.pageId, String(event.message));
+    });
+    if (jobId && isJobCancelled(jobId)) return errors;
+    for (const page of pending) {
+      const result = prepared.get(page.id);
+      if (!result) { errors.set(page.id, errors.get(page.id) || '처리 이미지를 준비하지 못했습니다.'); continue; }
+      const output = await fsp.readFile(result.outputPath);
+      const asset = await saveBufferAsset(output, `processing-${page.page_index + 1}.png`, 'image/png', 'page');
+      if ((jobId && isJobCancelled(jobId)) || !db.prepare('SELECT id FROM pages WHERE id = ?').get(page.id)) {
+        db.prepare('DELETE FROM assets WHERE id = ?').run(asset.id);
+        await fsp.unlink(assetPath({ storage_key: asset.storageKey })).catch(() => undefined);
+        return errors;
+      }
+      const oldAsset = page.processing_asset_id && db.prepare('SELECT * FROM assets WHERE id = ?').get(page.processing_asset_id);
+      db.transaction(() => {
+        db.prepare('UPDATE pages SET processing_asset_id = ?, processing_width = ?, processing_height = ?, processing_version = ? WHERE id = ?')
+          .run(asset.id, result.width, result.height, version, page.id);
+        if (oldAsset) db.prepare('DELETE FROM assets WHERE id = ?').run(oldAsset.id);
+      })();
+      await clearRenderedPage(page.id);
+      if (oldAsset) await fsp.unlink(assetPath(oldAsset)).catch(() => undefined);
     }
+    if (errors.size && !toleratePageErrors) throw new Error(`처리 이미지 준비 실패: ${Array.from(errors.values())[0]}`);
+    return errors;
   } finally {
-    renderActive = false;
+    await Promise.all(requests.map((page) => fsp.unlink(page.outputPath).catch(() => undefined)));
   }
 }
 
@@ -1194,8 +1242,8 @@ async function runRenderJob(jobId) {
       db.prepare('UPDATE jobs SET progress = ? WHERE id = ?').run(Math.min(99, Math.max(1, Math.round(progress))), jobId);
     });
     if (!rendered || isJobCancelled(jobId)) return;
-    db.prepare(`UPDATE jobs SET status = 'completed', current_stage = 'completed', progress = 100, finished_at = ?, error_message = NULL WHERE id = ?`)
-      .run(new Date().toISOString(), jobId);
+    db.prepare(`UPDATE jobs SET status = 'completed', current_stage = 'completed', progress = 100, finished_at = ?, error_message = ? WHERE id = ?`)
+      .run(new Date().toISOString(), renderCompletionWarning(job.chapter_id), jobId);
   } catch (error) {
     if (!isJobCancelled(jobId)) {
       db.prepare(`UPDATE jobs SET status = 'failed', current_stage = 'failed', error_message = ?, finished_at = ? WHERE id = ?`)
@@ -1204,90 +1252,82 @@ async function runRenderJob(jobId) {
   }
 }
 
-async function renderChapterImages(chapterId, jobId = null, onProgress = () => {}) {
+async function renderChapterImages(chapterId, jobId, onProgress = () => {}) {
+  const token = jobId;
+  const pageErrors = await prepareChapterImages(chapterId, token, { toleratePageErrors: true });
+  if (jobId && isJobCancelled(jobId)) return false;
   const pages = db.prepare(`SELECT p.*, a.storage_key, a.original_name, a.mime_type
     FROM pages p JOIN assets a ON a.id = p.image_asset_id WHERE p.chapter_id = ? ORDER BY p.page_index`).all(chapterId);
+  await attachProcessingAssets(pages);
   const layers = db.prepare(`SELECT l.*, b.inpaint_mask_json, b.polygon_json AS source_polygon_json,
       b.layout_hint_json AS source_layout_hint_json FROM lettering_layers l JOIN pages p ON p.id = l.page_id
-    LEFT JOIN translations t ON t.id = l.translation_id
-    LEFT JOIN ocr_blocks b ON b.id = t.ocr_block_id
+    LEFT JOIN translations t ON t.id = l.translation_id LEFT JOIN ocr_blocks b ON b.id = t.ocr_block_id
     WHERE p.chapter_id = ? AND l.is_active = 1 AND TRIM(l.text) <> '' ORDER BY l.created_at`).all(chapterId);
-  const invalidLayerCount = layers.filter((layer) => !isRenderableLetteringLayer(layer)).length;
-  if (invalidLayerCount) {
-    throw new Error(`글자 위치가 유효하지 않은 식자 레이어 ${invalidLayerCount}개가 있어 원문 제거를 중단했습니다. 위치를 수정한 뒤 다시 실행해 주세요.`);
-  }
-  for (const layer of layers) {
-    const sourcePolygon = parseJson(layer.source_polygon_json, []);
-    const sourceBounds = getNormalizedPolygonBounds(sourcePolygon);
-    const letteringBounds = getNormalizedPolygonBounds(parseJson(layer.polygon_json, []));
-    if (sourceBounds?.area > 0 && letteringBounds?.area > sourceBounds.area * 10) {
-      layer.polygon_json = layer.source_polygon_json;
-    }
-  }
   const layersByPage = groupBy(layers, 'page_id');
-  const workToken = crypto.randomUUID();
   const inpaintPages = [];
-  let completedInpaintProgress = 0;
+  const workToken = crypto.randomUUID();
   try {
     onProgress(0);
     for (const page of pages) {
+      if (jobId && isJobCancelled(jobId)) return false;
+      if (pageErrors.has(page.id) || (page.rendered_asset_id && !page.render_error)) continue;
       const pageLayers = layersByPage[page.id] || [];
       if (!pageLayers.length) continue;
       const maskPath = path.join(config.inpaintWorkPath, `${workToken}-${page.id}-mask.png`);
       const outputPath = path.join(config.inpaintWorkPath, `${workToken}-${page.id}-lama.png`);
-      await fsp.writeFile(maskPath, await createInpaintMask(assetPath(page), pageLayers, { inpaintPadding: config.inpaintPadding }));
-      inpaintPages.push({ pageId: page.id, imagePath: assetPath(page), maskPath, outputPath });
-    }
-
-    let aiOutputs = new Map();
-    if (config.inpaintProvider === 'lama' && inpaintPages.length) {
-      if (!fs.existsSync(config.inpaintModelPath)) {
-        throw new Error('LaMa 인페인팅 모델 파일을 찾을 수 없어 식질을 중단했습니다. 저품질 보간 결과는 저장하지 않습니다.');
-      }
+      const workPage = { pageId: page.id, imagePath: processingPagePath(page), maskPath, outputPath };
+      inpaintPages.push(workPage);
       try {
-        aiOutputs = await runLamaInpaintWorker(jobId || workToken, inpaintPages, (progress) => {
-          const fraction = Math.min(1, Math.max(0, (progress - 5) / 90));
-          completedInpaintProgress = Math.max(completedInpaintProgress, fraction * 45);
-          onProgress(completedInpaintProgress);
-        });
+        if (pageLayers.some((layer) => !isRenderableLetteringLayer(layer))) throw new Error('식자 위치가 유효하지 않습니다. 번역 편집기에서 수정해 주세요.');
+        await fsp.writeFile(maskPath, await createInpaintMask(processingPagePath(page), pageLayers, { inpaintPadding: config.inpaintPadding }));
       } catch (error) {
-        if (jobId && isJobCancelled(jobId)) return false;
-        throw new Error(`LaMa 인페인팅에 실패해 식질 결과를 저장하지 않았습니다: ${error.message}`);
-      }
-      const missingInpaintOutputs = inpaintPages.filter((page) => {
-        const outputPath = aiOutputs.get(page.pageId);
-        return !outputPath || !fs.existsSync(outputPath);
-      });
-      if (missingInpaintOutputs.length) {
-        throw new Error(`LaMa 인페인팅 결과가 없는 페이지 ${missingInpaintOutputs.length}개가 있어 식질을 중단했습니다.`);
+        pageErrors.set(page.id, error.message);
       }
     }
-
-    const pageRenderProgress = 100 - completedInpaintProgress;
+    let outputs = new Map();
+    const readyPages = inpaintPages.filter((page) => !pageErrors.has(page.pageId));
+    if (config.inpaintProvider === 'lama' && readyPages.length) {
+      if (!fs.existsSync(config.inpaintModelPath)) throw new Error('LaMa 인페인팅 모델 파일을 찾을 수 없습니다.');
+      const restored = await runLamaInpaintWorker(token, readyPages, (progress) => onProgress(Math.round(progress * 0.45)));
+      outputs = restored.outputs;
+      for (const [pageId, message] of restored.errors) pageErrors.set(pageId, message);
+      for (const page of readyPages) {
+        if (!outputs.has(page.pageId) && !pageErrors.has(page.pageId)) pageErrors.set(page.pageId, 'LaMa 복원 결과가 없습니다.');
+      }
+    }
     for (const [index, page] of pages.entries()) {
       if (jobId && isJobCancelled(jobId)) return false;
-      const pageLayers = layersByPage[page.id] || [];
-      const pageProgress = (fraction) => completedInpaintProgress
-        + pageRenderProgress * (index + Math.min(1, Math.max(0, fraction))) / Math.max(1, pages.length);
-      if (pageLayers.length) {
-        const aiOutput = aiOutputs.get(page.id);
-        const basePath = aiOutput || assetPath(page);
-        const buffer = await renderTranslatedPage(basePath, pageLayers, {
-          inpaintPadding: config.inpaintPadding,
-          fontPath: config.letteringFontPath,
-          skipInpaint: Boolean(aiOutput),
-          onInpaintProgress: (fraction) => onProgress(pageProgress(fraction)),
-        });
-        await saveRenderedPage(page, buffer);
-      } else {
+      try {
+        if (pageErrors.has(page.id)) throw new Error(pageErrors.get(page.id));
+        const pageLayers = layersByPage[page.id] || [];
+        if (!pageLayers.length) await clearRenderedPage(page.id);
+        else if (!page.rendered_asset_id || page.render_error) {
+          const basePath = outputs.get(page.id) || processingPagePath(page);
+          const buffer = await renderTranslatedPage(basePath, pageLayers, {
+            fontPath: config.letteringFontPath, inpaintPadding: config.inpaintPadding,
+            skipInpaint: outputs.has(page.id),
+          });
+          if (jobId && isJobCancelled(jobId)) return false;
+          await saveRenderedPage(page, buffer);
+        }
+        db.prepare('UPDATE pages SET render_error = NULL WHERE id = ?').run(page.id);
+      } catch (error) {
+        if (jobId && isJobCancelled(jobId)) return false;
         await clearRenderedPage(page.id);
+        db.prepare('UPDATE pages SET render_error = ? WHERE id = ?').run(String(error.message).slice(0, 500), page.id);
+        pageErrors.set(page.id, error.message);
       }
-      onProgress(pageProgress(1));
+      onProgress(45 + Math.round((index + 1) / Math.max(1, pages.length) * 55));
     }
     return true;
   } finally {
     await Promise.all(inpaintPages.flatMap((page) => [page.maskPath, page.outputPath].map((filePath) => fsp.unlink(filePath).catch(() => undefined))));
   }
+}
+
+function renderCompletionWarning(chapterId) {
+  const failed = db.prepare('SELECT COUNT(*) AS count FROM pages WHERE chapter_id = ? AND render_error IS NOT NULL').get(chapterId).count;
+  return failed ? `식자에 실패한 ${failed}페이지는 원본을 유지했습니다. 번역 편집 후 이미지 렌더링을 다시 실행하면 해당 페이지를 재처리합니다.` : null;
 }
 
 async function saveRenderedPage(page, buffer) {
@@ -1300,6 +1340,8 @@ async function saveRenderedPage(page, buffer) {
     const now = new Date().toISOString();
     previousAsset = db.prepare(`SELECT a.* FROM pages p LEFT JOIN assets a ON a.id = p.rendered_asset_id WHERE p.id = ?`).get(page.id);
     db.transaction(() => {
+      const current = db.prepare('SELECT render_revision FROM pages WHERE id = ?').get(page.id);
+      if (!current || current.render_revision !== page.render_revision) throw new Error('렌더링 중 번역이 수정되었습니다. 이미지 렌더링을 다시 실행해 주세요.');
       db.prepare(`INSERT INTO assets (id, storage_key, original_name, mime_type, byte_size, sha256, kind, created_at)
         VALUES (?, ?, ?, 'image/png', ?, ?, 'page', ?)`).run(
         assetId,
@@ -1320,6 +1362,7 @@ async function saveRenderedPage(page, buffer) {
 }
 
 async function clearRenderedPage(pageId) {
+  db.prepare('UPDATE pages SET render_revision = render_revision + 1 WHERE id = ?').run(pageId);
   const previousAsset = db.prepare(`SELECT a.* FROM pages p LEFT JOIN assets a ON a.id = p.rendered_asset_id WHERE p.id = ?`).get(pageId);
   if (!previousAsset?.id) return;
   db.transaction(() => {
@@ -1333,7 +1376,7 @@ async function clearRenderedPages(chapterId) {
   const previousAssets = db.prepare(`SELECT a.* FROM pages p JOIN assets a ON a.id = p.rendered_asset_id WHERE p.chapter_id = ?`).all(chapterId);
   if (!previousAssets.length) return;
   db.transaction(() => {
-    db.prepare('UPDATE pages SET rendered_asset_id = NULL WHERE chapter_id = ?').run(chapterId);
+    db.prepare('UPDATE pages SET rendered_asset_id = NULL, render_revision = render_revision + 1 WHERE chapter_id = ?').run(chapterId);
     const deleteAsset = db.prepare('DELETE FROM assets WHERE id = ?');
     for (const asset of previousAssets) deleteAsset.run(asset.id);
   })();
@@ -1362,98 +1405,60 @@ async function runAutoTranslationJob(jobId) {
     .run(new Date().toISOString(), jobId);
   let ollamaModelReleased = config.aiTranslationProvider !== 'ollama';
   try {
+    await prepareChapterImages(chapter.id, jobId);
+    if (isJobCancelled(jobId)) return;
     await refreshStaleLetteringLayouts(jobId, chapter.id, blocks);
     if (isJobCancelled(jobId)) return;
-    const updateTranslationProgress = (progress) => {
-      db.prepare('UPDATE jobs SET progress = MAX(progress, ?) WHERE id = ?').run(Math.min(75, 3 + Math.round(progress * 0.72)), jobId);
-    };
-    let results;
-    let ollamaController;
-    if (config.aiTranslationProvider === 'ollama') {
-      const controller = new AbortController();
-      ollamaController = controller;
-      activeAiProcesses.set(jobId, { kill: () => controller.abort() });
-      results = await translateWithOllama(blocks, {
-        baseUrl: config.aiTranslationOllamaUrl,
-        model: config.aiTranslationOllamaModel,
-        targetLanguage: chapter.target_language || 'ko',
-        batchSize: config.aiTranslationOllamaBatchSize,
-        think: config.aiTranslationOllamaThink,
-        entityGlossary,
-        timeoutMs: config.aiTranslationOllamaTimeoutMs,
-        signal: controller.signal,
-        isCancelled: () => isJobCancelled(jobId),
-        onProgress: updateTranslationProgress,
-      });
-    } else {
-      results = await runTranslationWorker(jobId, {
-        sourceLanguage: 'ja',
-        targetLanguage: chapter.target_language || 'ko',
-        sourceCode: config.aiTranslationSourceCode,
-        targetCode: config.aiTranslationTargetCode,
-        texts: blocks.map((block) => applyGlossaryToSourceText(block.source_text, glossaryTerms)),
-      }, updateTranslationProgress);
-    }
-    if (isJobCancelled(jobId)) return;
-    if (!Array.isArray(results) || results.length !== blocks.length) throw new Error('AI 워커가 모든 OCR 블록의 번역 결과를 반환하지 않았습니다.');
-
-    if (config.aiTranslationProvider === 'ollama') {
-      for (let attempt = 0; attempt < 1; attempt += 1) {
-        const missingIndexes = blocks.flatMap((block, index) => (
-          String(block.source_text || '').trim()
-            && (!String(results[index]?.text || '').trim()
-              || (isKoreanTargetLanguage(chapter.target_language || 'ko') && !isKoreanText(results[index].text)))
-            ? [index]
-            : []
-        ));
-        if (!missingIndexes.length || isJobCancelled(jobId)) break;
-        const retryBlocks = missingIndexes.map((index) => ({
-          ...blocks[index],
-          nearbyDialogue: collectOllamaRetryContext(blocks, index),
-        }));
-        const retryResults = await translateWithOllama(retryBlocks, {
-          baseUrl: config.aiTranslationOllamaUrl,
-          model: config.aiTranslationOllamaModel,
-          targetLanguage: chapter.target_language || 'ko',
-          batchSize: 1,
-          think: config.aiTranslationOllamaThink,
-          entityGlossary,
-          timeoutMs: config.aiTranslationOllamaTimeoutMs,
-          signal: ollamaController.signal,
-          isCancelled: () => isJobCancelled(jobId),
-          onProgress: () => {},
-        });
-        if (isJobCancelled(jobId)) return;
-        retryResults.forEach((result, retryIndex) => {
-          const translatedText = String(result?.text || '').trim();
-          if (translatedText) results[missingIndexes[retryIndex]] = result;
-        });
-      }
-    }
-
-    if (isJobCancelled(jobId)) return;
-    if (isKoreanTargetLanguage(chapter.target_language || 'ko')) {
-      results = results.map((result) => {
-        const translatedText = String(result?.text || '').trim();
-        return translatedText && !isKoreanText(translatedText)
-          ? { ...result, text: '' }
-          : result;
-      });
-    }
-    const now = new Date().toISOString();
     const translatorId = config.aiTranslationProvider === 'ollama' ? 'ollama' : 'ctranslate2';
     const translatorVersion = config.aiTranslationProvider === 'ollama'
-      ? config.aiTranslationOllamaModel
-      : path.basename(config.aiTranslationModelPath);
-    const saveTranslations = db.transaction(() => {
-      for (const [index, result] of results.entries()) {
-        const translatedText = String(result?.text || '').trim();
-        if (!translatedText) continue;
-        const block = blocks[index];
-        const translationId = crypto.randomUUID();
-        const layerId = crypto.randomUUID();
-        db.prepare(`UPDATE translations SET is_active = 0, updated_at = ? WHERE ocr_block_id = ? AND target_language = ?`).run(now, block.id, chapter.target_language || 'ko');
-        db.prepare(`UPDATE lettering_layers SET is_active = 0, updated_at = ? WHERE translation_id IN (SELECT id FROM translations WHERE ocr_block_id = ? AND target_language = ?)`).run(now, block.id, chapter.target_language || 'ko');
+      ? config.aiTranslationOllamaModel : path.basename(config.aiTranslationModelPath);
+    const targetLanguage = chapter.target_language || 'ko';
+    const options = parseJson(job.options_json, {});
+    const pageContext = new Map();
+    for (const block of blocks) {
+      if (!pageContext.has(block.page_id)) pageContext.set(block.page_id, []);
+      pageContext.get(block.page_id).push(block.source_text);
+    }
+    const inputHashes = new Map(blocks.map((block) => [block.id, crypto.createHash('sha256').update(JSON.stringify({
+      source: block.source_text, context: pageContext.get(block.page_id), targetLanguage,
+      glossaryVersion, translatorId, translatorVersion, version: 'translation-checkpoint-v1', think: config.aiTranslationOllamaThink,
+      sourceCode: config.aiTranslationSourceCode, targetCode: config.aiTranslationTargetCode, beamSize: config.aiTranslationBeamSize,
+    })).digest('hex')]));
+    const existing = new Map(db.prepare(`SELECT t.* FROM translations t JOIN ocr_blocks b ON b.id = t.ocr_block_id
+      JOIN pages p ON p.id = b.page_id WHERE p.chapter_id = ? AND t.target_language = ? AND t.is_active = 1`)
+      .all(chapter.id, targetLanguage).map((translation) => [translation.ocr_block_id, translation]));
+    const pendingBlocks = blocks.filter((block) => {
+      const previous = existing.get(block.id);
+      if (!previous?.translated_text?.trim()) return true;
+      if (options.forceTranslation && previous.job_id !== jobId) return true;
+      return previous.translator_id != null && previous.input_hash !== inputHashes.get(block.id);
+    });
+    const checkpointIds = new Map();
+    const saveResult = (index, result) => {
+      if (isJobCancelled(jobId)) return;
+      const translatedText = String(result?.text || '').trim();
+      if (!translatedText || (isKoreanTargetLanguage(targetLanguage) && !isKoreanText(translatedText))) return;
+      const block = pendingBlocks[index];
+      if (!block) return;
+      const now = new Date().toISOString();
+      const checkpointId = checkpointIds.get(block.id);
+      // A newer manual edit takes precedence over a result still in flight.
+      const latest = db.prepare('SELECT * FROM translations WHERE ocr_block_id = ? AND target_language = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1').get(block.id, targetLanguage);
+      if (latest && latest.id !== existing.get(block.id)?.id && latest.id !== checkpointId) return;
+      const translationId = checkpointId || crypto.randomUUID();
+      const layerId = crypto.randomUUID();
+      const saved = db.transaction(() => {
+        const currentBlock = db.prepare('SELECT source_text FROM ocr_blocks WHERE id = ?').get(block.id);
+        if (!currentBlock || currentBlock.source_text !== block.source_text) return false;
+        const current = db.prepare('SELECT id FROM translations WHERE ocr_block_id = ? AND target_language = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1').get(block.id, targetLanguage);
+        if (current && current.id !== existing.get(block.id)?.id && current.id !== checkpointId) return false;
+        if (checkpointId) {
+          db.prepare('UPDATE translations SET translated_text = ?, updated_at = ? WHERE id = ?').run(translatedText, now, checkpointId);
+          db.prepare('UPDATE lettering_layers SET text = ?, updated_at = ? WHERE translation_id = ? AND is_active = 1').run(translatedText, now, checkpointId);
+          return true;
+        }
+        db.prepare('UPDATE translations SET is_active = 0, updated_at = ? WHERE ocr_block_id = ? AND target_language = ?').run(now, block.id, targetLanguage);
+        db.prepare('UPDATE lettering_layers SET is_active = 0, updated_at = ? WHERE translation_id IN (SELECT id FROM translations WHERE ocr_block_id = ? AND target_language = ?)').run(now, block.id, targetLanguage);
         const contentKind = normalizeLetteringContentKind(result.kind) || inferLetteringContentKind(block, result.kind);
         db.prepare(`INSERT INTO translations (id, ocr_block_id, source_language, target_language, translated_text, translator_id, translator_version, glossary_version, content_kind, is_active, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`).run(
@@ -1484,9 +1489,95 @@ async function runAutoTranslationJob(jobId) {
           now,
           now,
         );
+        db.prepare('UPDATE translations SET input_hash = ?, job_id = ? WHERE id = ?').run(inputHashes.get(block.id), jobId, translationId);
+        return true;
+      })();
+      if (!saved) return;
+      checkpointIds.set(block.id, translationId);
+      void clearRenderedPage(block.page_id).catch((error) => console.warn('Render invalidation:', error.message));
+    };
+    const updateTranslationProgress = (progress) => {
+      db.prepare('UPDATE jobs SET progress = MAX(progress, ?) WHERE id = ?').run(Math.min(75, 3 + Math.round(((blocks.length - pendingBlocks.length + pendingBlocks.length * progress / 100) / blocks.length) * 72)), jobId);
+    };
+    let results;
+    let ollamaController;
+    if (!pendingBlocks.length) {
+      results = [];
+      updateTranslationProgress(100);
+    } else if (config.aiTranslationProvider === 'ollama') {
+      const controller = new AbortController();
+      ollamaController = controller;
+      activeAiProcesses.set(jobId, { kill: () => controller.abort() });
+      results = await translateWithOllama(pendingBlocks.map((block) => ({ ...block, nearbyDialogue: collectOllamaRetryContext(blocks, blocks.indexOf(block)) })), {
+        baseUrl: config.aiTranslationOllamaUrl,
+        model: config.aiTranslationOllamaModel,
+        targetLanguage: chapter.target_language || 'ko',
+        batchSize: config.aiTranslationOllamaBatchSize,
+        think: config.aiTranslationOllamaThink,
+        entityGlossary,
+        timeoutMs: config.aiTranslationOllamaTimeoutMs,
+        signal: controller.signal,
+        isCancelled: () => isJobCancelled(jobId),
+        onProgress: updateTranslationProgress,
+        onResult: saveResult,
+      });
+    } else {
+      results = await runTranslationWorker(jobId, {
+        sourceLanguage: 'ja',
+        targetLanguage: chapter.target_language || 'ko',
+        sourceCode: config.aiTranslationSourceCode,
+        targetCode: config.aiTranslationTargetCode,
+        texts: pendingBlocks.map((block) => applyGlossaryToSourceText(block.source_text, glossaryTerms)),
+      }, updateTranslationProgress, saveResult);
+    }
+    if (isJobCancelled(jobId)) return;
+    if (!Array.isArray(results) || results.length !== pendingBlocks.length) throw new Error('AI 워커가 모든 OCR 블록의 번역 결과를 반환하지 않았습니다.');
+
+    if (config.aiTranslationProvider === 'ollama') {
+      for (let attempt = 0; attempt < 1; attempt += 1) {
+        const missingIndexes = pendingBlocks.flatMap((block, index) => (
+          String(block.source_text || '').trim()
+            && (!String(results[index]?.text || '').trim()
+              || (isKoreanTargetLanguage(chapter.target_language || 'ko') && !isKoreanText(results[index].text)))
+            ? [index]
+            : []
+        ));
+        if (!missingIndexes.length || isJobCancelled(jobId)) break;
+        const retryBlocks = missingIndexes.map((index) => ({
+          ...pendingBlocks[index],
+          nearbyDialogue: collectOllamaRetryContext(blocks, blocks.indexOf(pendingBlocks[index])),
+        }));
+        const retryResults = await translateWithOllama(retryBlocks, {
+          baseUrl: config.aiTranslationOllamaUrl,
+          model: config.aiTranslationOllamaModel,
+          targetLanguage: chapter.target_language || 'ko',
+          batchSize: 1,
+          think: config.aiTranslationOllamaThink,
+          entityGlossary,
+          timeoutMs: config.aiTranslationOllamaTimeoutMs,
+          signal: ollamaController.signal,
+          isCancelled: () => isJobCancelled(jobId),
+          onProgress: () => {},
+          onResult: (retryIndex, result) => saveResult(missingIndexes[retryIndex], result),
+        });
+        if (isJobCancelled(jobId)) return;
+        retryResults.forEach((result, retryIndex) => {
+          const translatedText = String(result?.text || '').trim();
+          if (translatedText) results[missingIndexes[retryIndex]] = result;
+        });
       }
-    });
-    saveTranslations();
+    }
+
+    if (isJobCancelled(jobId)) return;
+    if (isKoreanTargetLanguage(chapter.target_language || 'ko')) {
+      results = results.map((result) => {
+        const translatedText = String(result?.text || '').trim();
+        return translatedText && !isKoreanText(translatedText)
+          ? { ...result, text: '' }
+          : result;
+      });
+    }
+    results.forEach((result, index) => saveResult(index, result));
     if (isJobCancelled(jobId)) return;
     const untranslatedCount = db.prepare(`SELECT COUNT(*) AS count FROM ocr_blocks b
       JOIN pages p ON p.id = b.page_id
@@ -1502,9 +1593,9 @@ async function runAutoTranslationJob(jobId) {
     });
     if (!rendered || isJobCancelled(jobId)) return;
     const finishedAt = new Date().toISOString();
-    const completionWarning = untranslatedCount
+    const completionWarning = [untranslatedCount
       ? `번역이 없는 OCR 블록 ${untranslatedCount}개는 원문을 유지했습니다. 번역 편집기에서 보완할 수 있습니다.`
-      : null;
+      : null, renderCompletionWarning(chapter.id)].filter(Boolean).join(' ') || null;
     db.prepare(`UPDATE jobs SET status = 'completed', current_stage = 'completed', progress = 100, finished_at = ?, error_message = ? WHERE id = ?`).run(finishedAt, completionWarning, jobId);
   } catch (error) {
     if (!isJobCancelled(jobId)) await failAutoTranslationJob(jobId, error.message || '자동 번역에 실패했습니다.');
@@ -1617,15 +1708,15 @@ function runAiWorkerProcess(jobId, payload, onEvent, extraEnv = {}) {
     activeAiProcesses.set(jobId, child);
     let stdout = '';
     let stderr = '';
-    let settled = false;
+    let failure;
     let finished = false;
     const fail = (error) => {
-      if (settled) return;
-      settled = true;
-      reject(error);
+      if (failure) return;
+      failure = error;
+      child.kill();
     };
     const handleLine = (line) => {
-      if (!line.trim()) return;
+      if (failure || !line.trim()) return;
       let event;
       try {
         event = JSON.parse(line);
@@ -1650,15 +1741,14 @@ function runAiWorkerProcess(jobId, payload, onEvent, extraEnv = {}) {
       lines.forEach(handleLine);
     });
     child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-8192); });
     child.on('error', (error) => fail(new Error(`AI 워커를 실행하지 못했습니다: ${error.message}`)));
     child.on('close', (code) => {
-      activeAiProcesses.delete(jobId);
-      if (settled) return;
+      if (activeAiProcesses.get(jobId) === child) activeAiProcesses.delete(jobId);
       if (stdout.trim()) handleLine(stdout.trim());
-      if (code !== 0) { fail(new Error(stderr.trim().slice(-500) || `AI 워커가 종료되었습니다(${code}).`)); return; }
-      if (!finished) { fail(new Error('AI 워커가 완료 이벤트 없이 종료되었습니다.')); return; }
-      settled = true;
+      if (failure) { reject(failure); return; }
+      if (code !== 0) { reject(new Error(stderr.trim().slice(-500) || `AI 워커가 종료되었습니다(${code}).`)); return; }
+      if (!finished) { reject(new Error('AI 워커가 완료 이벤트 없이 종료되었습니다.')); return; }
       resolve();
     });
     try {
@@ -1669,13 +1759,16 @@ function runAiWorkerProcess(jobId, payload, onEvent, extraEnv = {}) {
   });
 }
 
-function runTranslationWorker(jobId, payload, onProgress) {
+function runTranslationWorker(jobId, payload, onProgress, onResult = () => {}) {
   const results = [];
   return runAiWorkerProcess(jobId, payload, (event) => {
     if (event.type === 'progress') {
       onProgress(Math.min(100, Math.max(0, Number(event.progress) || 0)));
     }
-    if (event.type === 'result' && Number.isInteger(event.index)) results[event.index] = event;
+    if (event.type === 'result' && Number.isInteger(event.index)) {
+      results[event.index] = event;
+      onResult(event.index, event);
+    }
   }).then(() => results);
 }
 
@@ -1683,7 +1776,7 @@ async function runMangaOcrWorker(jobId, detections, onProgress) {
   const results = new Map();
   const pages = detections.map(({ page, blocks }) => ({
     pageIndex: page.page_index,
-    imagePath: assetPath(page),
+    imagePath: processingPagePath(page),
     candidates: blocks.map((block, candidateIndex) => ({
       candidateIndex,
       polygon: block.polygon,
@@ -1703,7 +1796,7 @@ async function runMangaOcrWorker(jobId, detections, onProgress) {
 
 async function runComicTextDetectorWorker(jobId, pages, onProgress) {
   const blocksByPage = new Map(pages.map((page) => [page.page_index, []]));
-  const detectorPages = pages.map((page) => ({ pageIndex: page.page_index, imagePath: assetPath(page) }));
+  const detectorPages = pages.map((page) => ({ pageIndex: page.page_index, imagePath: processingPagePath(page) }));
   await runAiWorkerProcess(jobId, { kind: 'detect', pages: detectorPages }, (event) => {
     if (event.type === 'progress') {
       onProgress(Math.min(100, Math.max(0, Number(event.progress) || 0)));
@@ -1753,6 +1846,7 @@ async function refreshStaleLetteringLayouts(jobId, chapterId, blocks) {
     JOIN assets a ON a.id = p.image_asset_id WHERE p.chapter_id = ? ORDER BY p.page_index`)
     .all(chapterId)
     .filter((page) => stalePageIndexes.has(page.page_index));
+  await attachProcessingAssets(pages);
   let detectedLayouts;
   try {
     detectedLayouts = await runComicTextDetectorWorker(jobId, pages, () => {});
@@ -1885,39 +1979,19 @@ function normalizeOptionalPolygon(value) {
 
 async function runLamaInpaintWorker(jobId, pages, onProgress) {
   const outputs = new Map();
+  const errors = new Map();
   await runAiWorkerProcess(jobId, { kind: 'inpaint', pages }, (event) => {
-    if (event.type === 'progress') {
-      onProgress(Math.min(100, Math.max(0, Number(event.progress) || 0)));
-    }
-    if (event.type === 'inpaint_result' && event.pageId && event.outputPath) {
-      outputs.set(String(event.pageId), String(event.outputPath));
-    }
+    if (event.type === 'progress') onProgress(Math.min(100, Math.max(0, Number(event.progress) || 0)));
+    if (event.type === 'inpaint_result') outputs.set(event.pageId, event.outputPath);
+    if (event.type === 'inpaint_error') errors.set(event.pageId, String(event.message));
   });
-  return outputs;
+  return { outputs, errors };
 }
 
 async function failAutoTranslationJob(jobId, message) {
   const current = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
   if (!current || current.status === 'cancelled') return;
   db.prepare(`UPDATE jobs SET status = 'failed', current_stage = 'failed', error_message = ?, finished_at = ? WHERE id = ?`).run(String(message).slice(0, 500), new Date().toISOString(), jobId);
-}
-
-function enqueueIngest(jobId) {
-  if (!ingestQueue.includes(jobId)) ingestQueue.push(jobId);
-  void drainIngestQueue();
-}
-
-async function drainIngestQueue() {
-  if (ingestActive) return;
-  ingestActive = true;
-  try {
-    while (ingestQueue.length) {
-      const jobId = ingestQueue.shift();
-      await runInProcessingTaskQueue(() => runIngestJob(jobId));
-    }
-  } finally {
-    ingestActive = false;
-  }
 }
 
 async function runIngestJob(jobId) {
@@ -1976,8 +2050,11 @@ async function renderPdfPages(filePath, onPage) {
       const page = await pdf.getPage(pageNumber);
       try {
         const baseViewport = page.getViewport({ scale: 1 });
-        const scale = Math.min(2, config.pdfRenderWidth / baseViewport.width);
-        const viewport = page.getViewport({ scale: Math.max(scale, 0.5) });
+        const scale = Math.min(2, config.pdfRenderWidth / baseViewport.width,
+          config.processingMaxSide / Math.max(baseViewport.width, baseViewport.height),
+          Math.sqrt(config.processingMaxPixels / (baseViewport.width * baseViewport.height)));
+        if (!(scale > 0) || !Number.isFinite(scale)) throw new Error('PDF 페이지 크기가 유효하지 않습니다.');
+        const viewport = page.getViewport({ scale });
         const output = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
         await page.render({ canvasContext: output.getContext('2d'), viewport }).promise;
         const buffer = output.toBuffer('image/png');
@@ -2025,7 +2102,8 @@ async function extractArchivePages(filePath, onPage) {
 }
 
 async function clearGeneratedPages(chapterId) {
-  const assets = db.prepare('SELECT a.* FROM assets a JOIN pages p ON p.image_asset_id = a.id WHERE p.chapter_id = ?').all(chapterId);
+  const sourceId = db.prepare('SELECT source_asset_id FROM chapters WHERE id = ?').get(chapterId)?.source_asset_id;
+  const assets = collectChapterAssets(chapterId).filter((asset) => asset.id !== sourceId);
   db.transaction(() => {
     db.prepare('DELETE FROM pages WHERE chapter_id = ?').run(chapterId);
     for (const asset of assets) db.prepare('DELETE FROM assets WHERE id = ?').run(asset.id);
@@ -2243,4 +2321,23 @@ function loadDotEnv(filePath) {
   }
 }
 
-process.on('SIGTERM', () => server.close(() => db.close()));
+function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearInterval(workerTimer);
+  clearTimeout(restartTimer);
+  for (const child of activeAiProcesses.values()) child.kill();
+  for (const worker of activeOcrWorkers.values()) void worker.terminate().catch(() => undefined);
+  if (processingOnly) {
+    process.exit(0); // The supervisor recovers interrupted jobs on the next start.
+  } else {
+    processingChild?.send({ type: 'shutdown' });
+    server.close(() => { db.close(); });
+  }
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+if (processingOnly) {
+  process.on('disconnect', shutdown);
+  process.on('message', (message) => { if (message?.type === 'shutdown') shutdown(); });
+}
